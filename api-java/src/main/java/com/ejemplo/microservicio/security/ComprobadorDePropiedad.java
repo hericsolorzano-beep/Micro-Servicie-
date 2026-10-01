@@ -1,6 +1,8 @@
 package com.ejemplo.microservicio.security;
 
+import com.ejemplo.microservicio.domain.Usuario;
 import com.ejemplo.microservicio.exception.AccesoDenegadoException;
+import com.ejemplo.microservicio.service.UsuarioService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.security.core.Authentication;
@@ -33,10 +35,34 @@ public class ComprobadorDePropiedad {
             LoggerFactory.getLogger(ComprobadorDePropiedad.class);
 
     /**
+     * Exige que el token sea del dueño del recurso Y que la cuenta siga
+     * activa.
+     *
+     * La segunda mitad es la que faltaba, y se encontró midiendo. Un JWT
+     * no se puede revocar: la firma es válida hasta que caduca, y el
+     * token vive una hora. Medido contra el stack:
+     *
+     *   token emitido con la cuenta ACTIVA
+     *   UPDATE usuario SET activo = false
+     *   GET  /usuarios/9                 -> 200
+     *   GET  /usuarios/9/transacciones   -> 200
+     *   POST /usuarios/9/transacciones   -> 200   (ademas escribe en la BD)
+     *
+     * Es decir: desactivar una cuenta, que es justo la medida que se toma
+     * cuando se sospecha de un robo, no cortaba nada. El campo `activo`
+     * existia y solo se usaba en el login; con un token ya emitido, la
+     * cuenta desactivada podia seguir operando una hora.
+     *
+     * La comprobacion va aqui y no en el emisor porque la revocacion solo
+     * puede vivir del lado del servidor: el token ya esta en manos del
+     * cliente y no se puede llamar de vuelta.
+     *
      * @param recursoId id del recurso solicitado en la ruta
-     * @throws AccesoDenegadoException si el token es de otro usuario
+     * @param usuarios  para leer el estado real de la cuenta
+     * @throws AccesoDenegadoException si el token es de otro usuario, o si
+     *         la cuenta ya no esta activa
      */
-    public void exigir(Long recursoId) {
+    public void exigir(Long recursoId, UsuarioService usuarios) {
 
         Long usuarioDelToken = usuarioActual();
 
@@ -57,6 +83,17 @@ public class ComprobadorDePropiedad {
         }
 
         if (!usuarioDelToken.equals(recursoId)) {
+            throw AccesoDenegadoException.comoSiNoExistiera();
+        }
+
+        // Mismo 404 mudo que "es de otro usuario". Un 403 aqui confirmaria
+        // que el id existe, que es justo lo que se quiere evitar.
+        Usuario usuario = usuarios.buscarPorId(usuarioDelToken);
+
+        if (usuario == null || !usuario.isActivo()) {
+            log.info("Peticion rechazada para el usuario {}: cuenta inactiva "
+                    + "o inexistente. El token sigue siendo valido hasta que "
+                    + "caduca.", usuarioDelToken);
             throw AccesoDenegadoException.comoSiNoExistiera();
         }
     }

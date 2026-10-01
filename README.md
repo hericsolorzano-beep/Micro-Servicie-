@@ -340,6 +340,24 @@ defecto en `NimbusJwtDecoder`; el tercero no. Sin `setJwtValidator`, un token
 con firma válida emitido por cualquier otro servicio que comparta el secreto
 daría acceso a datos de transacciones. Hay un test que lo demuestra.
 
+**Desactivar una cuenta corta el acceso aunque el token siga siendo
+válido.** Un JWT no se puede revocar: la firma vale hasta que caduca, y el
+token vive una hora. El campo `activo` solo se usaba en el login, así que
+desactivar la cuenta —que es la medida que se toma al sospechar de un robo—
+no cortaba nada durante esa hora. Medido contra el stack:
+
+```
+token emitido con la cuenta ACTIVA
+UPDATE usuario SET activo = false
+GET  /usuarios/9                 -> 200      <-- antes
+GET  /usuarios/9/transacciones   -> 200      <-- antes
+POST /usuarios/9/transacciones   -> 200      <-- antes, y escribía en la BD
+```
+
+Ahora los tres dan 404. La comprobación va en `ComprobadorDePropiedad`, no
+en el emisor, porque la revocación solo puede vivir del lado del servidor: el
+token ya está en manos del cliente y no se puede llamar de vuelta.
+
 `JWT_SECRET` es obligatorio y, si falta, `/actuator/health` lo reporta con un
 aviso. El motivo: sin secreto, la API **no falla**. Responde 200 a todo el
 mundo con una clave distinta en cada arranque, y lo único que se rompe son
@@ -626,7 +644,7 @@ se puede auditar después.
 ## Tests
 
 ```bash
-cd api-java && mvn test                                     # 82 tests
+cd api-java && mvn test                                     # 83 tests
 cd ia-python && ../.venv/bin/python test_modelos.py         # 16 tests
 cd ia-python && ../.venv/bin/python test_motor.py           # 11 tests
 cd ia-python && ../.venv/bin/python test_endpoint_fraude.py #  5 tests
@@ -641,15 +659,15 @@ Docker environment"*: `sg docker -c 'mvn test'`.
 |--------|-------|---------------|
 | Lógica de negocio | 7 | Decisiones de acción, nivel de riesgo y degradación |
 | Cliente HTTP | 5 | Serialización real contra un servidor simulado |
-| Contrato HTTP y autorización | 22 | Nombres de campo, 400/404/405/415, hash ausente, aislamiento |
+| Contrato HTTP y autorización | 23 | Nombres de campo, 400/404/405/415, hash ausente, aislamiento |
 | Seguridad (tokens) | 10 | Sin firmar, de otra clave, caducado, de otro emisor |
 | Comportamientos medidos | 9 | Tiempos de login, circuito, rangos |
 | Resiliencia | 6 | Que el retry reintenta de verdad, contando invocaciones |
 | Persistencia | 10 | BCrypt, `es_fraude` en NULL, transacción con IA caída |
 | Integración real | 13 | Java → Python → PostgreSQL, con la imagen de producción |
-| **Total** | **82** | |
+| **Total** | **83** | |
 
-**Java (82).** El bloque que más aporta es el de **seguridad**, porque los
+**Java (83).** El bloque que más aporta es el de **seguridad**, porque los
 tokens se firman con la misma librería que usa el servicio y no se falsea
 ningún validador: un token `alg:none` escrito a mano, uno firmado con otra
 clave, uno caducado y uno de otro emisor tienen que dar 401 los cuatro. Un

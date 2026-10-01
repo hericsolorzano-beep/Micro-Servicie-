@@ -51,7 +51,7 @@ public class UsuarioController {
         // Se comprueba la propiedad ANTES de tocar la base de datos: si el
         // token no es de este usuario, la respuesta es 404 sin revelar si
         // el usuario existe.
-        propiedad.exigir(id);
+        propiedad.exigir(id, usuarios);
 
         Usuario usuario = usuarios.buscarPorId(id);
         if (usuario == null) {
@@ -71,7 +71,7 @@ public class UsuarioController {
 
         // Propiedad primero: un token ajeno no debe poder gastar una
         // inferencia, ni aunque el usuario exista.
-        propiedad.exigir(id);
+        propiedad.exigir(id, usuarios);
 
         // Luego existencia: si no existe, gastaria una inferencia y un
         // hueco en el modelo de riesgo para nada.
@@ -107,7 +107,7 @@ public class UsuarioController {
         // permitiria enumerarlos probando identificadores. propiedad.exigir
         // ya lanza AccesoDenegadoException.comoSiNoExistiera() cuando el
         // token es de otro usuario.
-        propiedad.exigir(id);
+        propiedad.exigir(id, usuarios);
 
         if (usuarios.buscarPorId(id) == null) {
             throw AccesoDenegadoException.comoSiNoExistiera();

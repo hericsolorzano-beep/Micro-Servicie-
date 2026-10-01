@@ -88,8 +88,11 @@ class UsuarioControllerTest {
     }
 
     private void usuarioExistente(Long id) {
-        Mockito.when(usuarios.buscarPorId(id))
-                .thenReturn(new Usuario("ana@ejemplo.com", "Ana", "hash"));
+        // activo=true es obligatorio: exigir() comprueba el estado de la
+        // cuenta, asi que un Usuario por defecto ya serviria, pero se deja
+        // explicito para que un fallo del check sea legible.
+        Usuario u = new Usuario("ana@ejemplo.com", "Ana", "hash");
+        Mockito.when(usuarios.buscarPorId(id)).thenReturn(u);
     }
 
     // ------------------------------------------------------------------
@@ -154,13 +157,28 @@ class UsuarioControllerTest {
     }
 
     @Test
-    @DisplayName("Perfil de usuario inexistente devuelve 404")
-    void perfilInexistenteDa404() throws Exception {
+    @DisplayName("Una cuenta inexistente y una desactivada dan el mismo 404")
+    void inexistenteYDesactivadaSonIndistinguibles() throws Exception {
+        // Tres casos que el cliente NO puede distinguir, y no por
+        // casualidad: los tres significan "no tienes nada aqui". El
+        // cuarto, "es de otro usuario", tambien.
         Mockito.when(usuarios.buscarPorId(999L)).thenReturn(null);
+
+        Usuario desactivado = new Usuario("ana@ejemplo.com", "Ana", "hash");
+        desactivado.desactivar();
+        Mockito.when(usuarios.buscarPorId(1L)).thenReturn(desactivado);
 
         mockMvc.perform(get("/api/v1/usuarios/999").with(como(999L)))
                 .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.codigo").value("USUARIO_NO_ENCONTRADO"));
+                .andExpect(jsonPath("$.codigo").value("NO_ENCONTRADO"));
+
+        mockMvc.perform(get("/api/v1/usuarios/1").with(como(1L)))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.codigo").value("NO_ENCONTRADO"));
+
+        mockMvc.perform(get("/api/v1/usuarios/2").with(como(1L)))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.codigo").value("NO_ENCONTRADO"));
     }
 
     @Test
@@ -188,6 +206,43 @@ class UsuarioControllerTest {
     // ------------------------------------------------------------------
     // Propiedad: la parte que faltaba
     // ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("Una cuenta desactivada pierde el acceso aunque su token sea valido")
+    void unaCuentaDesactivadaPierdeElAcceso() throws Exception {
+
+        // Un JWT no se puede revocar: la firma vale hasta que caduca, y el
+        // token vive una hora. Medido contra el stack antes de comprobar el
+        // estado de la cuenta:
+        //
+        //   token emitido con la cuenta ACTIVA
+        //   UPDATE usuario SET activo = false
+        //   GET  perfil        -> 200
+        //   GET  historial     -> 200
+        //   POST transaccion   -> 200   (ademas escribe en la BD)
+        //
+        // Desactivar una cuenta, que es la medida que se toma al sospechar
+        // de un robo, no cortaba nada durante esa hora.
+        Usuario desactivado = new Usuario("ana@ejemplo.com", "Ana", "hash");
+        desactivado.desactivar();
+        Mockito.when(usuarios.buscarPorId(1L)).thenReturn(desactivado);
+
+        mockMvc.perform(get("/api/v1/usuarios/1").with(como(1L)))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.codigo").value("NO_ENCONTRADO"));
+
+        // Y el mismo 404 mudo que si fuera de otro usuario: un 403 aqui
+        // confirmaria que el id existe.
+        mockMvc.perform(post("/api/v1/usuarios/1/transacciones")
+                        .with(como(1L))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(TRANSACCION_VALIDA.formatted(componentes(28))))
+                .andExpect(status().isNotFound());
+
+        Mockito.verify(transacciones, Mockito.never())
+                .analizarYGuardar(ArgumentMatchers.anyLong(),
+                                  ArgumentMatchers.any());
+    }
 
     @Test
     @DisplayName("El historial de OTRO usuario devuelve 404, y no lista nada")
