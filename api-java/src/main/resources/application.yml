@@ -44,19 +44,21 @@ logging:
 # ---------------------------------------------------------------------
 # SEGURIDAD
 #
-# Desactivada por defecto para que el desarrollo local no exija
-# cabeceras. En produccion hay que poner AMBAS:
-#   SEGURIDAD_ACTIVADA=true
-#   SEGURIDAD_CLAVE=<una clave larga y aleatoria>
+# La seguridad NO se puede desactivar: toda peticion necesita un token
+# de sesion por usuario, y cada ruta comprueba que el token sea del
+# recurso que se pide.
 #
-# Riesgo asumido de este diseno: si el despliegue no define la variable,
-# la API queda abierta. Por eso /actuator/health reporta el estado de la
-# seguridad, para poder comprobarlo sin leer el codigo.
+# Lo que si se puede olvidar es el secreto con el que se firma, y ese
+# olvido no da ningun fallo visible: la API responde 200 y lo unico que
+# pasa es que cada reinicio invalida las sesiones. Por eso
+# /actuator/health reporta si la clave vino de la configuracion.
+#
+#   JWT_SECRET=<al menos 32 caracteres aleatorios>
+#   openssl rand -hex 32
 # ---------------------------------------------------------------------
 
-seguridad:
-  activada: ${SEGURIDAD_ACTIVADA:false}
-  clave: ${SEGURIDAD_CLAVE:}
+jwt:
+  secret: ${JWT_SECRET:}
 
 # ---------------------------------------------------------------------
 # IA

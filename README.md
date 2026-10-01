@@ -6,14 +6,17 @@ inferencia a un servicio Python con modelos de scikit-learn.
 ```
 microservicio/
 ├── ia-python/            Servicio de IA (interno, no expuesto)
-│   ├── entrenamiento.py    Genera y guarda el modelo de fraude
+│   ├── dataset_fraude.py Descarga y carga el dataset real de OpenML
+│   ├── entrenamiento.py  Genera y guarda el modelo de fraude
 │   ├── motor_sentimiento.py Transformer + respaldo, con degradación
 │   ├── main.py             FastAPI: carga modelos, expone /predict/*
 │   ├── comparar_modelos.py Compara TF-IDF vs transformer, y decide
-│   ├── test_modelos.py     Tests del contrato y del orden de columnas
-│   ├── test_motor.py       Tests del motor y de la degradación
+│   ├── test_modelos.py      Tests del contrato y del orden de columnas
+│   ├── test_motor.py        Tests del motor y de la degradación
+│   ├── test_endpoint_fraude.py  Tests del umbral frente a la respuesta
 │   ├── requirements.txt    Versiones fijadas
-│   ├── modelos/            .joblib generados
+│   ├── datos/            Dataset descargado (144 MB, NO versionado)
+│   ├── modelos/            .joblib generados (5 MB, NO versionados)
 │   ├── Dockerfile
 │   └── .dockerignore
 ├── api-java/             API publica (:8080)
@@ -27,32 +30,40 @@ microservicio/
 │       │   ├── repository/   Acceso a datos (Spring Data JPA)
 │       │   ├── domain/       Entidades JPA
 │       │   ├── client/       Cliente HTTP hacia Python
-│       │   ├── security/     Autenticación por clave de API
+│       │   ├── security/     Emisión de tokens y comprobación de propiedad
 │       │   ├── dto/          Contratos publicos y privados (separados)
-│       │   ├── config/       Cliente HTTP, timeouts, contraseñas
+│       │   ├── config/       Cliente HTTP, JWT, timeouts, contraseñas
 │       │   └── exception/    Manejo centralizado de errores
 │       └── resources/
 │           ├── application.yml
 │           └── db/migration/   Migraciones Flyway
 ├── postgres/             Imagen de PostgreSQL para desarrollo
+├── .env.ejemplo          Plantilla de credenciales
 ├── docker-compose.yml
 └── .venv/                Entorno Python local
 ```
 
 ## Ejecutar en local (sin Docker)
 
-Dos terminales, en este orden.
+Dos terminales, en este orden. El primer arranque descarga 144 MB de
+dataset, así que tarda.
 
 ```bash
 # 1) Servicio de IA (carga los modelos al arrancar)
 cd ia-python
-../.venv/bin/python entrenamiento.py      # solo la primera vez
+../.venv/bin/python -m dataset_fraude        # descarga el dataset (una vez)
+../.venv/bin/python entrenamiento.py         # entrena y guarda el modelo
 ../.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000
 
 # 2) API publica
 cd api-java
-mvn spring-boot:run
+JWT_SECRET=algo-fijo-para-local mvn spring-boot:run
 ```
+
+El dataset y los `.joblib` **no están en el repositorio** (144 MB y 5 MB).
+Por eso el `docker compose build` falla si nadie entrenó antes: es
+deliberado, un modelo inventado por el build sería peor que un error.
+
 
 ## Ejecutar con Docker
 
@@ -61,13 +72,14 @@ Primero, las credenciales. El repositorio no contiene ninguna: viven en
 
 ```bash
 cp .env.ejemplo .env
-# genera una contraseña real para la base
+# genera contraseñas y un secreto reales
 sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$(openssl rand -base64 24)|" .env
 sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=$(openssl rand -base64 24)|" .env
+sed -i "s|^JWT_SECRET=.*|JWT_SECRET=$(openssl rand -hex 32)|" .env
 ```
 
-Las dos claves deben ser **iguales** si quieres que la aplicación conecte
-con la base. Si prefieres separarlas (más realista en producción, donde la
+Las dos claves de base deben ser **iguales** si quieres que la aplicación
+conecte. Si prefieres separarlas (más realista en producción, donde la
 aplicación no debería ser propietaria del esquema), crea un rol aparte:
 
 ```bash
@@ -75,9 +87,14 @@ docker exec -it postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
   -c "CREATE ROLE api LOGIN PASSWORD 'otra'; GRANT SELECT,INSERT,UPDATE ON ALL TABLES IN SCHEMA public TO api;"
 ```
 
-Sin `.env`, `docker compose up` **falla** con un mensaje que dice qué
-variable falta. Es deliberado: un valor por defecto en el compose
-acabaría en producción.
+`JWT_SECRET` es **obligatorio**: sin él, `docker compose up` falla diciendo qué
+variable falta. No tiene valor por defecto a propósito, porque el
+contrapartida sería una API que arranca con una clave inventada y nadie se
+entera.
+
+Antes del primer `build`, hay que tener el modelo entrenado (ver más
+arriba), porque la imagen copia el `.joblib` y no entrena.
+
 
 ```bash
 docker compose up --build --wait
@@ -102,32 +119,38 @@ curl http://localhost:8000/health   # falla: es interno
 
 ## Endpoints
 
+Públicos:
+
 | Método | Ruta | Descripción |
 |--------|------|-------------|
-| POST | `/api/transacciones` | Analiza una transacción: fraude, probabilidad, nivel de riesgo y acción de negocio |
-| POST | `/api/texto` | Analiza sentimiento: positivo / negativo / neutro con probabilidades |
+| POST | `/api/v1/sesiones/usuarios` | Alta de usuario (201 + `Location`) |
+| POST | `/api/v1/sesiones/login` | Email + contraseña → token de sesión |
 | GET | `/actuator/health` | Estado de la API, del servicio de IA y de la base de datos |
 
-Con persistencia (versión 1 del contrato):
+Con token (`Authorization: Bearer <token>`):
 
 | Método | Ruta | Descripción |
 |--------|------|-------------|
-| POST | `/api/v1/usuarios` | Alta de usuario (201 + `Location`) |
-| GET | `/api/v1/usuarios/{id}` | Perfil (404 si no existe) |
-| POST | `/api/v1/usuarios/{id}/transacciones` | Analiza **y guarda** |
-| GET | `/api/v1/usuarios/{id}/transacciones` | Historial paginado, con filtro `soloFraude` |
+| POST | `/api/transacciones` | Analiza una transacción: fraude, probabilidad, umbral, nivel de riesgo y acción |
+| POST | `/api/texto` | Analiza sentimiento: positivo / negativo / neutro con probabilidades |
+| GET | `/api/v1/usuarios/{id}` | Perfil. Solo el propio: otro id da 404 |
+| POST | `/api/v1/usuarios/{id}/transacciones` | Analiza **y guarda**. Solo el propio |
+| GET | `/api/v1/usuarios/{id}/transacciones` | Historial paginado, con filtro `soloFraude`. Solo el propio |
 
-Variables de entorno con valor por defecto:
+**No existe listado global.** `GET /api/v1/transacciones` devuelve 404, y hay
+un test que falla si alguien lo añade. Con un parámetro de propietario
+faltante, cualquier cliente podría ver las transacciones de todos.
+
+Variables de entorno:
 
 | Variable | Default | Para qué |
 |----------|---------|----------|
+| `JWT_SECRET` | (ninguno, compose lo exige) | Secreto de firma de los tokens |
 | `IA_BASE_URL` | `http://localhost:8000` | Dónde está el servicio de IA |
 | `DB_URL` | `jdbc:postgresql://localhost:5432/microservicio` | Base de datos |
 | `DB_USER` / `DB_PASSWORD` | `microservicio` | Credenciales |
 | `LOG_LEVEL` | `INFO` | Verbo del log de aplicación |
 | `HEALTH_SHOW_DETAILS` | `never` | Detalles del actuator. Usa `always` solo en local |
-| `SEGURIDAD_ACTIVADA` | `false` | Exige la cabecera `X-API-Key` |
-| `SEGURIDAD_CLAVE` | (vacío) | La clave esperada. Sin ella, todo se rechaza |
 
 Del lado de Python:
 
@@ -145,28 +168,63 @@ Internos (solo accesibles desde la red de compose):
 
 ## Ejemplos
 
+El camino completo: registrarse, entrar y usar el token.
+
 ```bash
-# Transacción legítima -> APROBADA
-curl -s -X POST http://localhost:8080/api/transacciones \
-  -H "Content-Type: application/json" \
-  -d '{"monto":150,"hora":12,"pais":"ES","distancia_km":80}'
+V=http://localhost:8080/api/v1
 
-# Transacción sospechosa -> BLOQUEADA
-curl -s -X POST http://localhost:8080/api/transacciones \
-  -H "Content-Type: application/json" \
-  -d '{"monto":9000,"hora":3,"pais":"NG","distancia_km":5200}'
+# 1) Alta
+curl -s -X POST $V/sesiones/usuarios -H "Content-Type: application/json" \
+  -d '{"email":"ana@ejemplo.com","nombre":"Ana","contrasena":"contrasena-larga-123"}'
 
-# Sentimiento
-curl -s -X POST http://localhost:8080/api/texto \
-  -H "Content-Type: application/json" \
-  -d '{"texto":"Pésima calidad, llegó roto y nadie responde"}'
+# 2) Login: la contraseña en claro se cambia por un token
+TOKEN=$(curl -s -X POST $V/sesiones/login -H "Content-Type: application/json" \
+  -d '{"email":"ana@ejemplo.com","contrasena":"contrasena-larga-123"}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+
+# 3) Transacción legítima real del dataset -> APROBADA
+curl -s -X POST http://localhost:8080/api/transacciones \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"componentes":[-0.2743,0.1401,2.227,-0.3606,-0.397,-0.6929,0.0618,-0.3533,-1.699,0.7048,0.0971,-0.5307,1.2179,-0.5407,1.5355,0.3505,0.7263,-1.3437,2.464,0.5843,-0.0503,-0.0985,-0.1118,0.3975,-0.0495,-0.2278,-0.0697,-0.1301],"monto":12.0,"hora":12,"pais":"ES","distancia_km":80}'
+
+# 4) Sin token
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/api/v1/usuarios/1/transacciones
+# 401
 ```
+
+`componentes` son los 28 valores `V1..V28` de una fila del dataset. Ver
+más abajo por qué el contrato tiene `pais` y `distancia_km` pero el modelo
+no los mira.
+
 
 ## Números reales de los modelos
 
-**Fraude (RandomForest)** — 99.7% accuracy sobre 60.000 transacciones sintéticas
-con 6% de fraude. Recall 0.99 en la clase minoritaria, que es la que importa:
-dejar pasar un fraude cuesta más que revisar una transacción legítima de más.
+**Fraude (RandomForest)** — entrenado con el dataset de fraude con tarjetas de
+crédito de **ULB**, publicado en OpenML (`data_id=1597`): **284.807
+transacciones reales**, de las cuales **492 son fraude (0,1727%)**.
+
+Medido sobre el 20% de prueba, que el modelo no vio en el entrenamiento:
+
+| Métrica | Valor | Por qué esa y no otra |
+|---------|-------|----------------------|
+| ROC AUC | 0,9525 | Cómo separa las dos clases en todo el rango de umbrales |
+| Average precision | 0,8561 | Precisión media en cada punto operable del detector |
+| Recall @ 0,30 | **82 de 98** (83,7%) | Cuántos fraudes reales se atrapan |
+| Precision @ 0,30 | 93,2% | Cuántos de los marcados eran fraude de verdad |
+| Accuracy | 99,95% | **No se publica como métrica** |
+
+El accuracy se descarta a propósito, y el script de entrenamiento lo dice
+explícitamente. Con 0,17% de fraude, un modelo que **siempre** dijera "no es
+fraude" saca 99,83%. Esa cifra no dice nada del modelo: describe la
+proporción de la clase mayoritaria. Es la trampa clásica de los datasets
+desequilibrados, y es la razón de que aquí la cifra protagonista sea el
+recall sobre la clase minoritaria.
+
+**El umbral operativo es 0,30, no 0,50.** A 0,50 se atrapan menos fraudes. A
+0,30 se atrapan 16 de cada 100 y se revisan 7 de cada 100 limpias: en un
+sistema de pago, perder un fraude cuesta más que revisar una transacción
+clean de más. La métrica publicada es la del sistema real, y para eso el
+umbral se guarda **dentro** del `.joblib`, junto al modelo.
 
 **Sentimiento (XLM-RoBERTa)** — 15/15 sobre el conjunto de comparación, y
 funciona con sarcasmo y preguntas, cosa que el clasificador clásico no lograba.
@@ -191,6 +249,31 @@ La latencia se midió, no se estimó. 296 ms cabe de sobra en el
 Cambiar de motor es una variable de entorno, no un cambio de código:
 `IA_TRANSFORMER=0` arranca con el clasificador clásico.
 
+### Lo que el dataset real impone, y el contrato no puede arreglar
+
+**V1–V28 son componentes PCA anonimizados.** El dataset no publica las
+variables originales: no hay columna de "país", ni de "sexo", ni de
+"distancia". El modelo **no es interpretable**: no puede decir *por qué* una
+transacción es fraude, que es justo lo que necesita un detector real para
+que un revisor humano entienda la decisión.
+
+Por eso `pais` y `distancia_km` **se conservan en el contrato pero no
+influyen en el modelo**. Quitarlos rompería clientes; mantenerlos en
+silencio dejaría a alguien creyendo que el modelo los mira. La respuesta
+incluye `senas_analizadas: "componentes_PCA"` para que no haya duda.
+
+**El dataset tiene 1.825 transacciones con importe 0,00.** La API las
+rechaza con `monto > 0`, y es lo correcto: una transacción de cero euros no
+es una transacción. El dataset es más permisivo que el contrato, y aquí se
+prefiere el contrato.
+
+**La tasa de fraude real es del 0,17%, no del 6%.** Un modelo entrenado con
+datos sintéticos parecía mucho mejor de lo que es, porque el problema era más
+fácil. Es la razón de que el recall, y no el accuracy, sea la cifra que
+manda: en el dataset real, "acertar el 99,95%" y "no detectar nada" son casi
+lo mismo.
+
+
 ### Cómo se eligió, y no por gusto
 
 `comparar_modelos.py` corre ambos modelos sobre las mismas 15 frases, que
@@ -214,34 +297,55 @@ de los dos fallos daba error: eran números.
 
 ## Seguridad y resiliencia
 
-### Autenticación
+### Autenticación: token por usuario, no clave compartida
 
-Cabecera `X-API-Key`, comparada en **tiempo constante** con
-`MessageDigest.isEqual`. No es paranoia: `String.equals()` devuelve `false`
-en cuanto encuentra el primer carácter distinto, así que el tiempo que
-tarda revela cuántos caracteres lleva acertados el atacante, que puede
-reconstruir la clave byte a byte midiendo peticiones.
+La versión anterior usaba una cabecera `X-API-Key` compartida. **No era
+suficiente, y el fallo se comprobó en ejecución**: con la misma clave,
+`GET /api/v1/usuarios/1/transacciones` y
+`GET /api/v1/usuarios/2/transacciones` devolvían ambos **200**. La clave
+identificaba a la *aplicación*, no a la *persona*, así que cualquier cliente
+que la tuviera leía el historial de cualquiera. Autenticar a un cliente no es
+autorizar a un usuario.
 
-Viene **desactivada por defecto** para que `curl` funcione en local. Ese
-default tiene un riesgo evidente, y por eso `/actuator/health` publica si
-la autenticación está activa: convierte un olvido de despliegue en algo
-visible en un health check, que es donde se mira de verdad.
+Ahora hay login y **JWT**:
 
-Para activarla:
-
-```bash
-SEGURIDAD_CLAVE=$(openssl rand -hex 32) SEGURIDAD_ACTIVADA=true docker compose up -d
+```
+POST /api/v1/sesiones/login  {email, contrasena}  ->  {token, tipo, usuario_id}
+Authorization: Bearer <token>
 ```
 
-Si se activa sin clave, **falla cerrado**: rechaza todas las peticiones.
-Lo contrario (aceptar una clave vacía) abriría la API por un descuido de
-configuración.
+El **subject** del token es el id del usuario, y `ComprobadorDePropiedad` lo
+compara con el `{id}` de la ruta **antes de tocar la base de datos**. Tres
+detalles que parecen menores y no lo son:
 
-El 401 dice `No autorizado` y nada más. Untest detectó que mi mensaje
-anterior, *"Credenciales ausentes o inválidas"*, sí distinguía los dos
-casos y confirmaba al atacante que iba por buen camino.
+**404 y no 403 cuando el token es de otro.** Un 403 respondería *"existe, pero
+no es tuyo"*, lo que permite enumerar usuarios válidos probando
+identificadores. El 404 no distingue "no existe" de "no es tuyo", que es
+justo lo que se busca. El coste es que un cliente que pregunta por el recurso
+equivocado no entiende el motivo.
+
+**El error de login es el mismo para usuario inexistente y contraseña
+errónea**, y `UsuarioService` busca siempre y verifica con BCrypt en vez de
+devolver antes. Distinguirlos por el cuerpo **o por el tiempo de respuesta**
+permitiría enumerar qué correos están registrados.
+
+**Se validan firma, caducidad y emisor.** Los dos primeros vienen por
+defecto en `NimbusJwtDecoder`; el tercero no. Sin `setJwtValidator`, un token
+con firma válida emitido por cualquier otro servicio que comparta el secreto
+daría acceso a datos de transacciones. Hay un test que lo demuestra.
+
+`JWT_SECRET` es obligatorio y, si falta, `/actuator/health` lo reporta con un
+aviso. El motivo: sin secreto, la API **no falla**. Responde 200 a todo el
+mundo con una clave distinta en cada arranque, y lo único que se rompe son
+las sesiones al reiniciar. Un arranque fallido sería más honesto, pero dejaría
+el desarrollo local sin poder levantarse sin configurar nada.
+
+Se eliminó también el código muerto: `Identidad.java`, `FiltroApiKey`,
+`ValidadorApiKey` y `PropiedadesSeguridad` no se usaban en ningún sitio. Una
+clase de seguridad que nadie llama parece protección.
 
 ### Resiliencia
+
 
 Tres patrones, porque fallan cosas distintas:
 
@@ -275,9 +379,17 @@ que el modelo coincide.
 
 | | |
 |---|---|
-| Esquema | `usuario`, `transaccion` |
-| Migraciones | `db/migration/V1__esquema_inicial.sql` |
+| Esquema | `usuario`, `transaccion`, `transaccion_componente` |
+| Migraciones | `V1__esquema_inicial.sql`, `V2__componentes_dataset_real.sql` |
 | Pool | HikariCP, 10 conexiones máximas |
+
+La **V2** añade lo que el dataset real exige: las 28 componentes van en su
+propia tabla (`transaccion_componente`, con clave compuesta
+`(transaccion_id, indice)`), y la transacción guarda `numero_componentes` y
+el `umbral` con el que se decidió. Guardar el umbral es lo que permite
+releer el histórico sabiendo **con qué criterio** se tomó cada decisión, y
+no presuponer el actual. Guardar las componentes permite **reevaluar** el
+histórico si el modelo cambia, en vez de tener solo un veredicto muerto.
 
 **`ddl-auto: validate`, no `update`.** Con `update`, Hibernate puede alterar
 o borrar columnas sin que nadie lo haya decidido. Con `validate`, Flyway crea
@@ -289,11 +401,17 @@ Las restricciones viven **también** en la base de datos:
 ```sql
 CONSTRAINT chk_hora_rango CHECK (hora BETWEEN 0 AND 23)
 CONSTRAINT chk_monto_positivo CHECK (monto > 0)
+CONSTRAINT chk_numero_componentes CHECK (numero_componentes = 28)
 CONSTRAINT chk_probabilidad CHECK (probabilidad IS NULL OR probabilidad BETWEEN 0 AND 1)
 ```
 
 Validar en Java es cómodo; validar solo en Java deja un hueco por donde
 alguien puede insertar una hora de 25 saltándose la API.
+
+`umbral` es `DOUBLE PRECISION` y no `NUMERIC(4,3)` por una razón concreta:
+Hibernate valida el tipo contra el de la entidad y rechaza la migración con
+un error que no menciona la causa. Salió al ejecutar, no al leer.
+
 
 ### Lo que se guarda cuando la IA falla
 
@@ -340,7 +458,41 @@ conexión con las credenciales.
 
 ## Decisiones de diseño
 
+**El umbral se guarda DENTRO del `.joblib`, no en la configuración.** El
+entrenamiento elige el punto de operación, así que el umbral viaja con el
+modelo. Si viviera en un `application.yml`, bastaría desplegar el mismo
+`.joblib` con otro umbral para que las métricas publicadas dejaran de
+describir el sistema. Y un umbral guardado y no usado es peor que uno
+ausente: el servicio lo reportaba en cada respuesta mientras decidía con
+otro. Eso pasó, y el síntoma fue una transacción con probabilidad 0,50 que
+salía `es_fraude=false` con `nivel_riesgo="alto"`.
+
+**El entrenamiento ocurre FUERA del build de Docker.** El dataset son 144 MB
+y la imagen solo copia el `.joblib` de 5 MB. La consecuencia aceptada: si
+nadie entrenó, el build **falla con un mensaje explícito** en vez de
+inventar un modelo. Un despliegue con un modelo de juguete que responde 200
+es peor que un despliegue que no arranca.
+
+**El accuracy no se reporta.** Con 0,17% de fraude, "acertar el 99,95%" y
+"no detectar nada" son casi la misma cifra. Se publica ROC AUC, average
+precision y recall sobre la clase minoritaria, y el script de entrenamiento
+imprime el aviso para que nadie reintroduzca el número fácil.
+
+**El histórico guarda el criterio, no solo el veredicto.** `transaccion`
+guarda el `umbral` con el que se decidió y `numero_componentes`, y las 28
+componentes van en su propia tabla. Con eso se puede releer el pasado
+sabiendo con qué reglas se juzgó, y reevaluarlo si el modelo cambia. Guardar
+solo `es_fraude` es guardar un resultado sin su razonamiento, que es
+exactamente lo que no se puede auditar.
+
+**Los 404 de propiedad no consultan la base de datos.** La comprobación va
+antes de tocar nada, y hay un test con `verifyNoInteractions`. Un 404 que
+abre la base para comprobar y luego negar sigue filtrando información por el
+tiempo de respuesta, que es un canal de lado no intencionado.
+
 **Modelos cargados al arrancar, no por petición.** Un `.joblib` pesa
+varios MB y tarda cientos de ms en deserializarse. Cargarlo dentro del
+handler multiplicaría esa latencia por cada request. Un `.joblib` pesa
 varios MB y tarda cientos de ms en deserializarse. Cargarlo dentro del
 handler multiplicaría esa latencia por cada request.
 
@@ -408,64 +560,87 @@ ese país.
 ## Tests
 
 ```bash
-cd api-java && mvn test                              # 49 tests
-cd ia-python && ../.venv/bin/python test_modelos.py  # 11 tests
-cd ia-python && ../.venv/bin/python test_motor.py    # 11 tests
+cd api-java && mvn test                                     # 72 tests
+cd ia-python && ../.venv/bin/python test_modelos.py         # 16 tests
+cd ia-python && ../.venv/bin/python test_motor.py           # 11 tests
+cd ia-python && ../.venv/bin/python test_endpoint_fraude.py #  5 tests
 ```
 
-Los tests de persistencia usan **Testcontainers** y levantan un PostgreSQL
-real, así que **necesitan Docker**. Si tu sesión aún no pertenece al grupo
-`docker`, o falla con *"Could not find a valid Docker environment"*.
+Los tests de persistencia y de integración usan **Testcontainers** y levantan
+un PostgreSQL real y la imagen real de Python, así que **necesitan Docker**.
+Si tu sesión no pertenece al grupo `docker`, falla con *"Could not find a valid
+Docker environment"*: `sg docker -c 'mvn test'`.
 
-**H2 se eliminó.** Con H2 los tests creaban las tablas desde el modelo de
-JPA y **nunca ejecutaban las migraciones de Flyway**: el esquema de
-producción no lo comprobaba nadie. Ahora Flyway aplica `V1__esquema_inicial.sql`
-y `ddl-auto: validate` verifica que las entidades encajen. Comprobado:
-romper la migración a propósito hace fallar los tests con
-`column "columna_que_no_existe" does not exist`.
+| Bloque | Tests | Qué comprueba |
+|--------|-------|---------------|
+| Lógica de negocio | 7 | Decisiones de acción, nivel de riesgo y degradación |
+| Cliente HTTP | 5 | Serialización real contra un servidor simulado |
+| Contrato HTTP y autorización | 22 | Nombres de campo, 400/404/405/415, hash ausente, aislamiento |
+| Seguridad (tokens) | 10 | Sin firmar, de otra clave, caducado, de otro emisor |
+| Resiliencia | 6 | Que el retry reintenta de verdad, contando invocaciones |
+| Persistencia | 10 | BCrypt, `es_fraude` en NULL, transacción con IA caída |
+| Integración real | 12 | Java → Python → PostgreSQL, con la imagen de producción |
+| **Total** | **72** | |
 
-**Java (49).** 7 de lógica de negocio, 5 del cliente HTTP contra un
-`MockRestServiceServer` (que serializa y deserializa de verdad, así que un
-cambio de nombre de campo se detecta aquí), 10 del contrato HTTP público,
-9 de seguridad, 6 de resiliencia y 10 de persistencia contra H2.
+**Java (72).** El bloque que más aporta es el de **seguridad**, porque los
+tokens se firman con la misma librería que usa el servicio y no se falsea
+ningún validador: un token `alg:none` escrito a mano, uno firmado con otra
+clave, uno caducado y uno de otro emisor tienen que dar 401 los cuatro. Un
+filtro que deja pasar lo que debe rechazar es el fallo típico, y solo aparece
+al ejercerlo.
 
-Los de persistencia no prueban que el CRUD funcione (eso lo da cualquier
+**El bloque de aislamiento** importa porque prueba la corrección que motivó
+el cambio de seguridad: con el token de Ana, el historial de Bruno es 404 **y
+el servicio no se llama** (`verifyNoInteractions`). Un 404 que abre la base de
+datos para comprobar y luego negar sigue filtrando información por el tiempo
+de respuesta.
+
+**Los de persistencia no prueban que el CRUD funcione** (eso lo da cualquier
 framework). Prueban lo difícil: que la transacción se guarde **aunque la IA
-falle**, que su `es_fraude` quede en `NULL` y no en `false`, que no cuente
-como fraude, que la contraseña se guarde hasheada con BCrypt y que dos
-usuarios con la misma contraseña tengan hashes distintos.
+falle**, que su `es_fraude` quede en `NULL` y no en `false`, que la contraseña
+se guarde hasheada con BCrypt y que dos usuarios con la misma contraseña
+tengan hashes distintos.
 
 **H2 se eliminó.** Los tests usan PostgreSQL real vía Testcontainers, por un
 motivo concreto: con H2, `ddl-auto: create-drop` construía las tablas desde
-las entidades y **Flyway no se ejecutaba nunca**. Bastaba un error de
-sintaxis o un tipo incompatible en la migración para que llegara hasta el
-despliegue. Ahora se ejecuta lo mismo que en producción.
+las entidades y **Flyway no se ejecutaba nunca**. Bastaba un error de sintaxis
+o un tipo incompatible en la migración para que llegara hasta el despliegue.
+Ahora se ejecuta lo mismo que en producción. Comprobado: romper la migración a
+propósito hace fallar los tests con `column "columna_que_no_existe" does not
+exist`.
 
-Los de seguridad usan el filtro de verdad, no una simulación: comprueban que
-sin clave el endpoint **no se ejecuta** (`verifyNoInteractions`), que el 401
-no distingue entre clave mala y clave ausente, y que activar sin clave
-rechaza todo.
-
-Los de resiliencia cuentan invocaciones reales al cliente. Eso es lo único
-que distingue "el retry reintentó 3 veces" de "el retry no hace nada".
-
-**Python (11).** El que importa es
+**Python.** El que más importa es
 `test_main_construye_la_fila_en_el_orden_entrenado`: intercepta la fila que
 `main.py` realmente construye y la compara con los índices que espera el
-`ColumnTransformer`. Lejos de ahí, un desajuste haría que el modelo
-predijera con el sentido invertido sin lanzar ningún error. Comprobado:
-reordenar esa fila hace fallar el test.
+`ColumnTransformer`. Lejos de ahí, un desajuste haría que el modelo predijera
+con el sentido invertido sin lanzar ningún error. Comprobado: reordenar esa
+fila hace fallar el test.
 
-El resto cubre el contrato de campos contra los esquemas reales de FastAPI
-(no contra un dict escrito en el propio test), que `PAISES_CONOCIDOS`
-coincida con los países que el encoder sabe tratar, y una comprobación de
-humo del clasificador.
+`test_endpoint_fraude.py` existe por un bug real. El servicio **guardaba y
+reportaba** el umbral entrenado (0,30) pero decidía `es_fraude` con
+`predict()`, que usa el argmax y por tanto 0,5. El síntoma era discreto: una
+transacción con probabilidad 0,50 salía
 
-**Degradación (11).** Lo que más importa aquí no es que el transformer
-clasifique bien, sino qué pasa **cuando falla**: se le inyecta un motor que
-lanza `RuntimeError` y se comprueba que la petición se sigue atendiendo con
-el respaldo, que el estado lo refleja, y que tres fallos seguidos no dejan
-el servicio a medias.
+```
+es_fraude=false, nivel_riesgo="alto"
+```
 
-Ningún conjunto tarda más de unos segundos, porque ninguno entrena modelos
-(el de `test_motor.py` tarda ~30 s solo en cargar el transformer).
+y Java la traducía a `APROBADA` sobre algo que el propio servicio daba por
+sospechoso. Sin excepción, sin 500: solo una decisión incoherente. El
+sistema hacía lo contrario de lo que decían sus propias métricas, porque el
+recall de 0,84 se midió en 0,30 y el servicio corría en 0,5. Ahora hay cinco
+tests que verifican la invariante `probabilidad >= umbral ⟺ es_fraude`.
+
+La primera versión de ese test escribía a mano unas componentes "de fraude"
+copiadas de una salida truncada, y resultó que tenían probabilidad 0,05: no
+eran fraude. Pasaba por la razón equivocada. Ahora las filas salen de
+`dataset_fraude` y están verificadas.
+
+**Degradación.** Lo que importa no es que el transformer clasifique bien,
+sino qué pasa **cuando falla**: se le inyecta un motor que lanza
+`RuntimeError` y se comprueba que la petición se sigue atendiendo con el
+respaldo, que el estado lo refleja, y que tres fallos seguidos no dejan el
+servicio a medias.
+
+Ningún conjunto entrena modelos. El que carga el transformer tarda ~30 s solo
+en eso.

@@ -6,14 +6,15 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 import com.ejemplo.microservicio.client.ClienteIAService;
 import com.ejemplo.microservicio.dto.PeticionFraudePython;
+import com.ejemplo.microservicio.dto.RespuestaFraude;
 import com.ejemplo.microservicio.dto.RespuestaFraudePython;
 import com.ejemplo.microservicio.dto.SolicitudTexto;
 import com.ejemplo.microservicio.dto.SolicitudTransaccion;
 import com.ejemplo.microservicio.exception.ServicioIANoDisponibleException;
+import com.ejemplo.microservicio.config.ConfiguracionJwt;
 import com.ejemplo.microservicio.security.ConfiguracionSeguridad;
-import com.ejemplo.microservicio.security.ValidadorApiKey;
+import com.ejemplo.microservicio.security.EmisorDeToken;
 import com.ejemplo.microservicio.service.AnalisisService;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -22,6 +23,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.request.RequestPostProcessor;
 
 /**
  * Tests del contrato HTTP publico.
@@ -34,33 +36,34 @@ import org.springframework.test.web.servlet.MockMvc;
  * para los clientes que ya consumen esta API.
  */
 @WebMvcTest(controllers = AnalisisController.class)
-@Import(ConfiguracionSeguridad.class)
+@Import({ConfiguracionSeguridad.class, ConfiguracionJwt.class,
+        EmisorDeToken.class})
+@org.springframework.test.context.TestPropertySource(properties =
+        "jwt.secret=clave-de-prueba-larga-suficiente-1234567890")
 class AnalisisControllerTest {
-
-    // @WebMvcTest solo carga los beans de la capa web. FiltroApiKey es un
-    // filtro de servlet y SI entra, pero su dependencia ValidadorApiKey no.
-    // Sin declararla aqui el contexto no arranca, y los 10 tests fallan con
-    // un error que no tiene nada que ver con lo que se quiere probar.
-    @MockitoBean
-    private ValidadorApiKey validadorApiKey;
-
-    /**
-     * Estos tests cubren el contrato HTTP, no la seguridad. La seguridad
-     * viene desactivada por defecto (es lo que permite curl en local), asi
-     * que el filtro deja pasar y estos tests ven lo que el endpoint
-     * responde de verdad. La seguridad tiene su propia clase de test.
-     *
-     * Sin esto, un mock devuelve false por defecto, el filtro rechaza
-     * cada peticion con 401 y los 10 tests fallarian por un motivo que no
-     * es el que persiguen.
-     */
-    @BeforeEach
-    void desactivarSeguridad() {
-        org.mockito.Mockito.when(validadorApiKey.estaActivada()).thenReturn(false);
-    }
 
     @Autowired
     private MockMvc mockMvc;
+
+    @Autowired
+    private EmisorDeToken emisor;
+
+    /**
+     * Estos tests cubren el CONTRATO, no la seguridad. La seguridad tiene
+     * su propia clase (SeguridadJwtTest), donde se comprueba que un token
+     * malo, caducado o de otra clave NO entra.
+     *
+     * Aqui hace falta un token valido en cada peticion porque ahora la
+     * seguridad no se puede desactivar. Sin esto, cada test fallaria con
+     * un 401 que no dice nada del contrato que se quiere comprobar.
+     */
+    private RequestPostProcessor conToken() {
+        return peticion -> {
+            peticion.addHeader("Authorization",
+                    "Bearer " + emisor.emitir(1L, "ana@ejemplo.com"));
+            return peticion;
+        };
+    }
 
     // @MockitoBean sustituye al @MockBean deprecado en Spring Boot 3.4+.
     // Mismo efecto, pero sin el aviso de eliminacion.
@@ -72,13 +75,12 @@ class AnalisisControllerTest {
     void transaccionValida() throws Exception {
         org.mockito.Mockito.when(analisisService.analizarTransaccion(
                         org.mockito.ArgumentMatchers.any(SolicitudTransaccion.class)))
-                .thenReturn(new com.ejemplo.microservicio.dto.RespuestaFraude(
-                        true, 0.93, "critico", "rf", "BLOQUEADA", 12L));
+                .thenReturn(new RespuestaFraude(true, 0.93, "critico", "rf", "BLOQUEADA", 12L, 0.30, "componentes_PCA"));
 
-        mockMvc.perform(post("/api/transacciones")
+        mockMvc.perform(post("/api/transacciones").with(conToken())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"monto":9500,"hora":3,"pais":"NG","distancia_km":5200}"""))
+                                {"componentes":[1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234],"monto":9500,"hora":3,"pais":"NG","distancia_km":5200}"""))
                 .andExpect(status().isOk())
                 // snake_case exacto: es lo que consume el cliente externo.
                 .andExpect(jsonPath("$.es_fraude").value(true))
@@ -90,10 +92,10 @@ class AnalisisControllerTest {
     @Test
     @DisplayName("Monto negativo devuelve 400 con detalle por campo")
     void montoNegativoDa400() throws Exception {
-        mockMvc.perform(post("/api/transacciones")
+        mockMvc.perform(post("/api/transacciones").with(conToken())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"monto":-50,"hora":3,"pais":"NG","distancia_km":5200}"""))
+                                {"componentes":[1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234],"monto":-50,"hora":3,"pais":"NG","distancia_km":5200}"""))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.codigo").value("VALIDACION"))
                 .andExpect(jsonPath("$.detalles.monto").exists());
@@ -102,10 +104,10 @@ class AnalisisControllerTest {
     @Test
     @DisplayName("Pais en minusculas se rechaza por formato")
     void paisInvalidoDa400() throws Exception {
-        mockMvc.perform(post("/api/transacciones")
+        mockMvc.perform(post("/api/transacciones").with(conToken())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"monto":100,"hora":3,"pais":"ng","distancia_km":50}"""))
+                                {"componentes":[1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234],"monto":100,"hora":3,"pais":"ng","distancia_km":50}"""))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.detalles.pais").exists());
     }
@@ -117,10 +119,10 @@ class AnalisisControllerTest {
                         org.mockito.ArgumentMatchers.any(SolicitudTransaccion.class)))
                 .thenThrow(new ServicioIANoDisponibleException("IA caida"));
 
-        mockMvc.perform(post("/api/transacciones")
+        mockMvc.perform(post("/api/transacciones").with(conToken())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"monto":100,"hora":3,"pais":"ES","distancia_km":50}"""))
+                                {"componentes":[1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234],"monto":100,"hora":3,"pais":"ES","distancia_km":50}"""))
                 // 503 y no 500: el problema es nuestra dependencia, no la
                 // peticion. El cliente debe poder distinguir ambos casos.
                 .andExpect(status().isServiceUnavailable())
@@ -137,7 +139,7 @@ class AnalisisControllerTest {
                         java.util.Map.of("negativo", 0.96, "positivo", 0.03),
                         "tfidf"));
 
-        mockMvc.perform(post("/api/texto")
+        mockMvc.perform(post("/api/texto").with(conToken())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"texto":"Pésima calidad, llegó roto"}"""))
@@ -152,7 +154,7 @@ class AnalisisControllerTest {
         // Sin el handler explicito de HttpMessageNotReadableException, el
         // catch-all de Exception lo convierte en 500 y el cliente no puede
         // distinguir "tu JSON esta roto" de "tenemos un fallo".
-        mockMvc.perform(post("/api/transacciones")
+        mockMvc.perform(post("/api/transacciones").with(conToken())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"monto\": 100, \"hora\":}"))
                 .andExpect(status().isBadRequest())
@@ -162,7 +164,7 @@ class AnalisisControllerTest {
     @Test
     @DisplayName("Ruta inexistente devuelve 404, no 500")
     void rutaInexistenteDa404() throws Exception {
-        mockMvc.perform(post("/api/no-existe")
+        mockMvc.perform(post("/api/no-existe").with(conToken())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
                 .andExpect(status().isNotFound());
@@ -172,14 +174,14 @@ class AnalisisControllerTest {
     @DisplayName("GET en un endpoint de POST devuelve 405, no 500")
     void metodoIncorrectoDa405() throws Exception {
         mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
-                        .get("/api/transacciones"))
+                        .get("/api/transacciones").with(conToken()))
                 .andExpect(status().isMethodNotAllowed());
     }
 
     @Test
     @DisplayName("Content-Type incorrecto devuelve 415 con codigo propio")
     void tipoDeContenidoInvalidoDa415() throws Exception {
-        mockMvc.perform(post("/api/transacciones")
+        mockMvc.perform(post("/api/transacciones").with(conToken())
                         .contentType(MediaType.TEXT_PLAIN)
                         .content("monto=100"))
                 .andExpect(status().isUnsupportedMediaType())
@@ -199,10 +201,10 @@ class AnalisisControllerTest {
                                 io.github.resilience4j.circuitbreaker
                                         .CircuitBreaker.ofDefaults("servicioIA")));
 
-        mockMvc.perform(post("/api/transacciones")
+        mockMvc.perform(post("/api/transacciones").with(conToken())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"monto":9000,"hora":3,"pais":"NG","distancia_km":5200}"""))
+                                {"componentes":[1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234],"monto":9000,"hora":3,"pais":"NG","distancia_km":5200}"""))
                 .andExpect(status().isServiceUnavailable())
                 .andExpect(jsonPath("$.codigo").value("CIRCUITO_ABIERTO"));
     }
@@ -217,10 +219,10 @@ class AnalisisControllerTest {
                                 io.github.resilience4j.bulkhead
                                         .Bulkhead.ofDefaults("servicioIA")));
 
-        mockMvc.perform(post("/api/transacciones")
+        mockMvc.perform(post("/api/transacciones").with(conToken())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"monto":100,"hora":3,"pais":"ES","distancia_km":50}"""))
+                                {"componentes":[1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234],"monto":100,"hora":3,"pais":"ES","distancia_km":50}"""))
                 .andExpect(status().isServiceUnavailable())
                 .andExpect(jsonPath("$.codigo").value("SERVICIO_SATURADO"));
     }
@@ -228,7 +230,7 @@ class AnalisisControllerTest {
     @Test
     @DisplayName("Texto vacio devuelve 400")
     void textoVacioDa400() throws Exception {
-        mockMvc.perform(post("/api/texto")
+        mockMvc.perform(post("/api/texto").with(conToken())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"texto":""}"""))

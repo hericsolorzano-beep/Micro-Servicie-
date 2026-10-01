@@ -11,9 +11,9 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 COPY entrenamiento.py main.py motor_sentimiento.py ./
 
-# Los modelos se entrenan aqui, igual que en produccion: el test debe
-# usar el mismo .joblib que se desplegaria.
-RUN python entrenamiento.py
+# Mismo .joblib que la imagen de produccion: el test de integracion debe
+# verificar el contrato contra el modelo real, no contra uno distinto.
+COPY modelos/ ./modelos/
 
 # Sin transformer. En produccion arranca en ~16s y ocupa ~660MB; para
 # integration tests eso son 40s y un giga por cada ejecucion, y lo que

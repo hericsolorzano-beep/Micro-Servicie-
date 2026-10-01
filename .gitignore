@@ -7,6 +7,17 @@
 .env.*
 !.env.ejemplo
 
+# Dataset de OpenML: 144MB de transacciones reales.
+#
+# NO se versiona. Es un fichero publico y descargable, y meterlo en git
+# lo haria irreductible para siempre (git guarda cada version, asi que
+# un solo commit basta para que 144MB ocupen espacio para siempre).
+# dataset_fraude.py documenta la URL exacta de descarga.
+ia-python/datos/
+
+# Los .joblib tambien se ignoran: son 5MB generados por el entrenamiento.
+# La imagen de Docker los copia desde la maquina; si alguien despliega sin
+# entrenar antes, el build falla con un mensaje explicito.
 ia-python/modelos/*.joblib
 api-java/target/
 *.log

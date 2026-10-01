@@ -1,0 +1,84 @@
+name: Tests
+
+# Que corra en cada push y en cada pull request: el fallo tiene que verse
+# en el pull request, no dos semanas despues en el proximo despliegue.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: ia-python/requirements.txt
+
+      - name: Instalar dependencias
+        run: pip install -r ia-python/requirements.txt
+
+      # Los tests de Python necesitan los modelos cargados, y el modelo de
+      # fraude no esta en git (son 5 MB generados). Se entrena aqui, en el
+      # CI, y por eso el job tarda: es el precio de probar el modelo de
+      # verdad y no un doble.
+      #
+      # Se entrena sobre un subconjunto del dataset para no bajar 144 MB en
+      # cada ejecucion. El objetivo de este job es el contrato y el
+      # comportamiento, no la metrica: la metrica se mide una vez, con el
+      # dataset entero, y se publica en el README.
+      - name: Dataset de prueba
+        run: |
+          cd ia-python
+          python -m dataset_fraude --muestra 20000
+
+      - name: Entrenar
+        run: cd ia-python && python entrenamiento.py
+
+      - name: Tests del contrato y del motor
+        run: |
+          cd ia-python
+          python test_modelos.py
+          python test_motor.py
+          python test_endpoint_fraude.py
+
+  java:
+    runs-on: ubuntu-latest
+    # Testcontainers necesita un Docker daemon. El runner lo trae, asi que
+    # se ejecuta el job DENTRO de un contenedor maven con el socket de
+    # Docker del host montado. De ahi el --user root: el socket pertenece
+    # al host y su UID no coincide con el del contenedor.
+    container:
+      image: maven:3.9-eclipse-temurin-21
+      options: --user root -v /var/run/docker.sock:/var/run/docker.sock
+
+    # NO hay bloque services a proposito. Los tests levantan su propio
+    # PostgreSQL con Testcontainers, asi que declarar aqui uno seria un
+    # contenedor que nadie consulta y que solo haria esperar al arranque.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # Los tests de integracion levantan la imagen REAL de Python con
+      # Testcontainers. Si no se construye aqui, fallarian al no encontrar
+      # la etiqueta. Se construye sin cache para que un cambio en
+      # main.py no se quede con la imagen vieja: Docker cachea por
+      # contenido de los ficheros, y este es el motivo de que el fallo
+      # fuera dificil de ver en local.
+      - name: Construir la imagen de IA
+        run: docker build -f ia-python/Dockerfile.test -t microservicio-ia-python:test ia-python
+
+      - name: Tests
+        run: mvn -B test
+        env:
+          JWT_SECRET: clave-de-ci-que-no-importa-pero-es-fija
+          IA_BASE_URL: http://localhost:9999

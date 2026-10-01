@@ -82,8 +82,15 @@ class ClienteIAResilienteTest {
     @Autowired
     private io.github.resilience4j.bulkhead.BulkheadRegistry bulkheadRegistry;
 
+    /** 28 componentes PCA, como espera el modelo. */
+    private static java.util.List<Double> componentes() {
+        return java.util.stream.IntStream.range(0, 28)
+                .mapToObj(i -> 1.234)
+                .toList();
+    }
+
     private static final PeticionFraudePython PETICION =
-            new PeticionFraudePython(9000.0, 3, "NG", 5200.0);
+            new PeticionFraudePython(componentes(), 9000.0, 3, "NG", 5200.0);
 
     @BeforeEach
     void reiniciar() {
@@ -97,7 +104,7 @@ class ClienteIAResilienteTest {
     @DisplayName("Si la IA responde, el resultado pasa intacto")
     void exitoPasaIntacto() throws Exception {
         when(clienteReal.predecirFraude(any()))
-                .thenReturn(new RespuestaFraudePython(true, 0.93, "critico", "rf"));
+                .thenReturn(new RespuestaFraudePython(true, 0.93, "critico", "rf", 0.30));
 
         var r = servicio.predecirFraude(PETICION);
 
@@ -135,7 +142,7 @@ class ClienteIAResilienteTest {
             if (intentos.incrementAndGet() < 3) {
                 throw new ServicioIANoDisponibleException("reiniciando");
             }
-            return new RespuestaFraudePython(false, 0.01, "bajo", "rf");
+            return new RespuestaFraudePython(false, 0.01, "bajo", "rf", 0.30);
         });
 
         // Este es el caso que justifica el retry: Python reiniciandose.

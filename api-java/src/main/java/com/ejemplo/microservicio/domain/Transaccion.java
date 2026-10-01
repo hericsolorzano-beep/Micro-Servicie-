@@ -45,6 +45,17 @@ public class Transaccion {
     @Column(name = "distancia_km", nullable = false, precision = 10, scale = 1)
     private BigDecimal distanciaKm;
 
+    /**
+     * Nº de componentes PCA que se enviaron al modelo.
+     *
+     * Se guarda porque el modelo exige un numero exacto: si en el futuro
+     * cambia a 30 componentes, el dato historico sigue siendo valido con
+     * su 28. Sin este campo, una transaccion vieja no se podria
+     * reevaluar con el modelo nuevo sin adivinar.
+     */
+    @Column(name = "numero_componentes", nullable = false)
+    private Integer numeroComponentes;
+
     // Campos del veredicto. Todos nulables a proposito: una transaccion
     // se guarda AUNQUE la IA no estuviera disponible. Perder el registro
     // de lo que no se pudo evaluar seria peor que guardarlo sin veredicto.
@@ -64,6 +75,21 @@ public class Transaccion {
 
     @Column(length = 30)
     private String accion;
+
+    /**
+     * Umbral con el que el servicio de IA decidio el veredicto.
+     *
+     * Sin guardarlo, el historial no permite reconstruir por que una
+     * transaccion de hace seis meses se aprobo o se bloqueo: el
+     * umbral pudo haber cambiado desde entonces.
+     *
+     * Sin precision/scale a proposito: la columna es REAL, un tipo de
+     * coma flotante, y Hibernate rechaza la escala en esos tipos
+     * ("scale has no meaning for SQL floating point types"). El error
+     * sale al arrancar, no al escribir, asi que es facil no verlo.
+     */
+    @Column
+    private Double umbral;
 
     /**
      * Motivo por el que no se pudo analizar, si la IA fallo.
@@ -86,25 +112,29 @@ public class Transaccion {
     }
 
     public Transaccion(Usuario usuario, BigDecimal monto, Integer hora,
-                      String pais, BigDecimal distanciaKm) {
+                      String pais, BigDecimal distanciaKm,
+                      Integer numeroComponentes) {
         this.usuario = usuario;
         this.monto = monto;
         this.hora = hora;
         this.pais = pais;
         this.distanciaKm = distanciaKm;
+        this.numeroComponentes = numeroComponentes;
         this.creadoEn = Instant.now();
     }
 
     /** Registra el veredicto del modelo. */
     public void registrarVeredicto(Boolean esFraude, BigDecimal probabilidad,
                                    String nivelRiesgo, String modelo,
-                                   String accion, Long tiempoMs) {
+                                   String accion, Long tiempoMs,
+                                   Double umbral) {
         this.esFraude = esFraude;
         this.probabilidad = probabilidad;
         this.nivelRiesgo = nivelRiesgo;
         this.modelo = modelo;
         this.accion = accion;
         this.tiempoInferenciaMs = tiempoMs;
+        this.umbral = umbral;
         this.errorAnalisis = null;
     }
 
@@ -163,6 +193,14 @@ public class Transaccion {
 
     public String getAccion() {
         return accion;
+    }
+
+    public Integer getNumeroComponentes() {
+        return numeroComponentes;
+    }
+
+    public Double getUmbral() {
+        return umbral;
     }
 
     public String getErrorAnalisis() {

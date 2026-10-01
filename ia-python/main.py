@@ -5,11 +5,24 @@ Arrancar:  uvicorn main:app --host 0.0.0.0 --port 8000
 
 Este servicio NO se expone a internet. Solo lo consume Spring Boot.
 
-Detalle clave del diseno: los modelos se cargan UNA vez durante el
-arranque (evento startup) y quedan en memoria. Si los cargamos dentro
-del handler de cada request, cada llamada pagaria el coste de deserializar
-el .joblib desde disco (cientos de ms). En un servicio de inferencia eso
-es la diferencia entre 5 y 5000 peticiones por segundo.
+Los modelos se cargan UNA vez durante el arranque y quedan en memoria.
+Cargarlos por peticion costaria cientos de ms en cada llamada, y en un
+servicio de inferencia esa es la diferencia entre atender y no atender.
+
+FORMATO DE LA PETICION DE FRAUDE
+
+    {
+      "componentes": [V1..V28],   // 28 floats, senal PCA anonimizada
+      "hora": 12,                 // 0-23
+      "monto": 150.0,
+      "pais": "ES",               // informativo
+      "distancia_km": 0.0         // informativo
+    }
+
+    La senal real esta en "componentes". "pais" y "distancia_km" se
+    conservan en el contrato por compatibilidad, pero el modelo real no
+    los usa: el dataset de referencia no los tiene. Documentarlo aqui
+    evita que alguien asuma que el pais influye en la deteccion.
 """
 
 import os
@@ -25,55 +38,69 @@ from motor_sentimiento import construir_motor
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELOS_DIR = os.path.join(BASE_DIR, "modelos")
 
-# Paises que el modelo de fraude conoce de verdad (los de
-# PERFILES_PAIS en entrenamiento.py). Se declara aqui de forma explicita
-# para que el limite sea visible en el borde del servicio.
-PAISES_CONOCIDOS = {"ES", "FR", "DE", "US", "GB", "MX", "BR", "NG", "RU", "CN"}
+# Nº de componentes PCA del dataset de referencia. Es el que el modelo
+# espera, asi que llega en el esquema y no se valida despues.
+N_COMPONENTES = 28
 
-# Variables globales que se llenan en el arranque. None significa "el
-# servicio arranco pero no hay modelo", y el endpoint lo detecta.
-modelo_fraude = None
-motor_sentimiento = None
+# Paises aceptados por el esquema. El modelo NO los usa (el dataset no
+# tiene informacion de pais), asi que esta lista es de validacion de
+# formato, no de disponibilidad real.
+PAISES_VALIDOS = {
+    "ES", "FR", "DE", "GB", "IT", "PT", "NL", "BE", "AT", "IE", "FI",
+    "GR", "PL", "CZ", "SE", "NO", "DK", "CH", "US", "MX", "BR", "AR",
+    "CL", "CO", "PE", "NG", "ZA", "EG", "MA", "IN", "CN", "JP", "AU",
+    "NZ", "CA",
+}
 
 # El transformer pesa ~1 GB. En una maquina con poca RAM, o si se quiere
-# arrancar rapido, se apaga con IA_TRANSFORMER=0 y el servicio usa solo
-# el clasificador pequeno.
+# arrancar rapido, se apaga con IA_TRANSFORMER=0.
 USAR_TRANSFORMER = os.getenv("IA_TRANSFORMER", "1") == "1"
+
+modelo_fraude = None
+umbral_fraude = 0.5
+motor_sentimiento = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Carga los modelos antes de aceptar trafico.
 
-    FastAPI usa este patron en vez de codigo a nivel de modulo para que
-    las pruebas automatizadas puedan arrancar y parar el servicio sin
-    arrastrar estado entre ejecuciones.
+    Se usa este patron en vez de codigo a nivel de modulo para que las
+    pruebas puedan arrancar y parar el servicio sin arrastrar estado
+    entre ejecuciones.
     """
-    global modelo_fraude, motor_sentimiento
+    global modelo_fraude, umbral_fraude, motor_sentimiento
 
     inicio = time.perf_counter()
-
-    # El modelo de fraude es obligatorio: sin el, el servicio no sirve de
-    # nada y es mejor no arrancar que arrancar a medias.
     ruta_f = os.path.join(MODELOS_DIR, "fraude.joblib")
+    ruta_s = os.path.join(MODELOS_DIR, "sentimiento.joblib")
+
     if not os.path.exists(ruta_f):
         raise RuntimeError(
-            "No se encontro el modelo de fraude. "
-            "Ejecuta primero: python entrenamiento.py"
-        )
-    modelo_fraude = joblib.load(ruta_f)
+            "No se encontro el modelo de fraude. Ejecuta: python entrenamiento.py")
+    if not os.path.exists(ruta_s):
+        raise RuntimeError(
+            "No se encontro el modelo de sentimiento. "
+            "Ejecuta: python entrenamiento.py")
 
-    # El de sentimiento tiene respaldo, asi que su carga nunca aborta el
-    # arranque: si el transformer no viene, se usa el clasificador TF-IDF
-    # y el servicio sigue dando servicio con menor precision.
+    # El archivo guarda el modelo Y el umbral elegido en el entrenamiento.
+    # Guardarlos juntos evita que la metrica publicada describa un
+    # sistema que en produccion decide distinto.
+    cargado = joblib.load(ruta_f)
+    if isinstance(cargado, dict):
+        modelo_fraude = cargado["modelo"]
+        umbral_fraude = float(cargado["umbral"])
+    else:
+        # Formato antiguo: solo el modelo.
+        modelo_fraude = cargado
+        umbral_fraude = 0.5
+
     motor_sentimiento = construir_motor(usar_transformer=USAR_TRANSFORMER)
 
     ms = (time.perf_counter() - inicio) * 1000
-    print(f"[modelos] cargados en {ms:.0f} ms")
+    print(f"[fraude] cargado en {ms:.0f} ms (umbral {umbral_fraude:.3f})")
     print(f"[sentimiento] {motor_sentimiento.estado()}")
 
-    # Importante: yield cede el control. Hasta aqui es codigo de arranque;
-    # despues del yield corre el apagado.
     yield
 
     print("[modelos] descargados")
@@ -81,35 +108,42 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Microservicio IA",
-    description="Inferencia de fraude y sentimiento. Uso interno.",
-    version="1.0.0",
+    description="Inferencia de fraude (datos reales) y sentimiento. Uso interno.",
+    version="2.0.0",
     lifespan=lifespan,
-    # Este servicio es interno y se desplegaria detras de una API gateway
-    # que autentica. Publicar /docs y /openapi.json sin autenticacion
-    # permitiria enumerar el contrato a cualquiera que llegue a la red.
-    # En local son utiles para depurar con el navegador.
     docs_url="/docs",
     openapi_url="/openapi.json",
 )
 
 
 # ------------------------------------------------------------ SCHEMAS
-#
-# Validar en el borde es obligatorio aunque la red sea interna: Java podria
-# estar desactualizado respecto a este contrato, y un esquema roto que
-# llega al modelo produce errores dentro de sklearn, no errores claros.
 
 
 class TransaccionRequest(BaseModel):
-    monto: float = Field(gt=0, le=1_000_000, description="Importe en la moneda de la cuenta")
+    """
+    Senal del modelo.
+
+    componentes: V1..V28 del dataset de referencia, en ese orden. El
+    orden importa y no lo comprueba el esquema: un array de 28 floats
+    cumple la validacion tanto si viene bien ordenado como si no. El
+    test de orden de columnas existe por eso.
+    """
+    componentes: list[float] = Field(
+        min_length=N_COMPONENTES,
+        max_length=N_COMPONENTES,
+        description=f"Las {N_COMPONENTES} componentes PCA, en orden V1..V{N_COMPONENTES}"
+    )
+
+    monto: float = Field(gt=0, le=1_000_000, description="Importe de la transaccion")
     hora: int = Field(ge=0, le=23, description="Hora local de la operacion")
     pais: str = Field(
-        min_length=2,
-        max_length=2,
         pattern=r"^[A-Z]{2}$",
-        description="Codigo ISO de 2 letras en mayusculas",
+        description="Codigo ISO de 2 letras. NO lo usa el modelo.",
     )
-    distancia_km: float = Field(ge=0, le=20_000, description="Distancia al pais de la transaccion")
+    distancia_km: float = Field(
+        ge=0, le=40_000,
+        description="Distancia al pais. NO lo usa el modelo.",
+    )
 
 
 class FraudeResponse(BaseModel):
@@ -117,6 +151,7 @@ class FraudeResponse(BaseModel):
     probabilidad: float = Field(ge=0.0, le=1.0)
     nivel_riesgo: str
     modelo: str
+    umbral: float = Field(description="Umbral usado para decidir es_fraude")
 
 
 class TextoRequest(BaseModel):
@@ -135,24 +170,23 @@ class SentimientoResponse(BaseModel):
 
 @app.get("/health")
 def health():
-    """Sonda de salud.
-
-    La consume el healthcheck de compose y el indicador de actuator de
-    Java. Publica tambien el estado de cada motor, porque "sano" con el
-    transformer en modo respaldo es una situacion distinta a "sano" con
-    todo en su sitio: sirve, pero con menor precision.
     """
-    estado_motor = motor_sentimiento.estado() if motor_sentimiento else None
+    Sonda de salud. La consultan el healthcheck de compose y el indicador
+    de actuator de Java.
 
+    Publica el estado de cada motor porque "sano con el transformer en
+    respaldo" es una situacion distinta de "sano con todo en su sitio":
+    sirve, pero con menos precision.
+    """
     return {
         "estado": "ok",
-        # El healthcheck de compose mira ESTE campo:asi un contenedor con
-        # solo el modelo de respaldo se marca sano porque puede atender,
-        # no porque tenga el motor principal.
+        # El healthcheck de compose mira ESTE campo: un contenedor con
+        # solo el modelo de respaldo se marca sano porque puede atender.
         "modelos_cargados": modelo_fraude is not None and motor_sentimiento is not None,
         "fraude": modelo_fraude is not None,
         "sentimiento": motor_sentimiento is not None,
-        "motor_sentimiento": estado_motor,
+        "umbral_fraude": umbral_fraude,
+        "motor_sentimiento": motor_sentimiento.estado() if motor_sentimiento else None,
     }
 
 
@@ -161,32 +195,44 @@ def predecir_fraude(req: TransaccionRequest) -> FraudeResponse:
     if modelo_fraude is None:
         raise HTTPException(status_code=503, detail="El modelo de fraude no esta cargado")
 
-    # El OneHotEncoder se entreno con handle_unknown="ignore": un pais no
-    # visto se convierte en un vector de ceros y el modelo predice sin
-    # error pero sin ninguna señal del pais. Mejor un 422 explicito que una
-    # prediccion silenciosamente peor.
-    if req.pais not in PAISES_CONOCIDOS:
+    if req.pais not in PAISES_VALIDOS:
         raise HTTPException(
             status_code=422,
             detail=f"Pais no soportado: {req.pais}. "
-                   f"Conocidos: {', '.join(sorted(PAISES_CONOCIDOS))}")
+                   f"Conocidos: {', '.join(sorted(PAISES_VALIDOS))}")
 
-    # Mismo orden de columnas que el entrenamiento. Este es el punto mas
-    # fragile de todo el servicio: si el orden cambia aqui y no en
-    # entrenamiento.py, el modelo predice sin error pero con el sentido
-    # invertido. sklearn no valida nombres en un array numerico.
-    # El test test_orden_de_columnas_esperado_por_el_transformer existe
-    # precisamente para que un refactor aqui no pase desapercibido.
-    X = [[req.monto, req.hora, req.pais, req.distancia_km]]
+    # Fila en el orden que espera el entrenamiento: [Time, V1..V28, Amount].
+    #
+    # Time se reconstruye como hora*3600. Es una aproximacion: el dataset
+    # real mide segundos desde la primera transaccion de la campana, no
+    # la hora del dia. El modelo es robusto a esa diferencia porque Time
+    # casi no entra entre las variables importantes, pero conviene
+    # saberlo si alguien lee las metricas y pregunta por que no se envia
+    # el Time original.
+    tiempo = req.hora * 3600.0
+    fila = [tiempo] + list(req.componentes) + [req.monto]
 
-    prediccion = int(modelo_fraude.predict(X)[0])
-    probabilidad = float(modelo_fraude.predict_proba(X)[0][1])
+    probabilidad = float(modelo_fraude.predict_proba([fila])[0][1])
+
+    # es_fraude se decide con el UMBRAL DEL ENTRENAMIENTO, no con
+    # predict().
+    #
+    # predict() devuelve el argmax de predict_proba, es decir, decide en
+    # 0.5. Eso ignora el umbral con el que se entreno y se eligio (0.30),
+    # y deja el sistema haciendo EXACTAMENTE lo contrario de lo que dicen
+    # las metricas publicadas: el recall de 0.84 se midio en 0.30, pero
+    # el servicio corre en 0.5.
+    #
+    # Consecuencia observada: una transaccion con probabilidad 0.50
+    # salia es_fraude=false pero nivel_riesgo="alto", y Java devolvia
+    # APROBADA para algo que el nivel daba por sospechoso. Incoherente.
+    prediccion = int(probabilidad >= umbral_fraude)
 
     if probabilidad >= 0.85:
         nivel = "critico"
-    elif probabilidad >= 0.5:
+    elif probabilidad >= 0.50:
         nivel = "alto"
-    elif probabilidad >= 0.2:
+    elif probabilidad >= umbral_fraude:
         nivel = "medio"
     else:
         nivel = "bajo"
@@ -195,7 +241,8 @@ def predecir_fraude(req: TransaccionRequest) -> FraudeResponse:
         es_fraude=bool(prediccion),
         probabilidad=round(probabilidad, 4),
         nivel_riesgo=nivel,
-        modelo="random_forest_fraude",
+        modelo="random_forest_fraude_datos_reales",
+        umbral=umbral_fraude,
     )
 
 
@@ -209,24 +256,19 @@ def predecir_sentimiento(req: TextoRequest) -> SentimientoResponse:
         resultado = motor_sentimiento.predecir(req.texto)
 
     except RuntimeError as e:
-        # Ningun motor disponible: eso si es un 503, porque el servicio no
-        # puede contestar. El 503 lo ve Java y lo traduce a "IA no
-        # disponible", que es lo que el cliente espera.
+        # Ningun motor disponible: si que es un 503, porque no se puede
+        # contestar. Java lo traduce a "IA no disponible".
         raise HTTPException(status_code=503, detail=str(e)) from e
 
     except Exception as e:
-        # Un fallo inesperado (texto que rompe el tokenizer, memoria...).
-        # Se registra entero y se responde 500 sin detalles: la traza no
-        # sale hacia el cliente.
         import logging
         logging.getLogger(__name__).exception("Fallo en inferencia de sentimiento")
         raise HTTPException(
             status_code=500,
             detail="Error interno en la inferencia de sentimiento") from e
 
-    # El motor puede añadir "nota" cuando esta en modo respaldo. No forma
-    # parte del esquema de respuesta (que es el contrato estable con
-    # Java), asi que se descarta aqui.
+    # El motor puede añadir "nota" en modo respaldo. No forma parte del
+    # esquema (que es el contrato estable con Java), asi que se descarta.
     resultado.pop("nota", None)
 
     return SentimientoResponse(**resultado)

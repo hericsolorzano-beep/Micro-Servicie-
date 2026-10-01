@@ -1,4 +1,4 @@
-package com.ejemplo.microservicio.service;
+package com.ejemplo.microservicio.exception;
 
 /**
  * El usuario indicado no existe.

@@ -3,12 +3,17 @@ __pycache__/
 *.pyo
 .venv/
 venv/
-modelos/
-*.joblib
 .pytest_cache/
 .idea/
 .vscode/
 *.log
+# NOTA: modelos/ NO se excluye. El .joblib (5MB) va dentro de la
+# imagen: es el resultado del entrenamiento, y sin el el contenedor
+# arranca sin poder inferir. Los datos crudos (144MB) si se excluyen.
+
+# El dataset son 144MB y solo se usa para ENTRENAR. La imagen
+# de runtime lleva el modelo ya entrenado, no los datos crudos.
+datos/
 comparar_modelos.py
 test_modelos.py
 test_motor.py

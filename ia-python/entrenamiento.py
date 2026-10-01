@@ -1,24 +1,44 @@
 """
-Entrena los dos modelos del microservicio y los persiste en ./modelos.
+Entrena los dos modelos y los persiste en ./modelos.
 
 Ejecutar:  python entrenamiento.py
 
-Cada modelo se guarda con joblib (pickle optimizado para arrays de numpy,
-que es justo lo que scikit-learn produce). El archivo resultante lo carga
-despues main.py al arrancar el servidor.
+DATOS DE FRAUDE
+    Vienen de OpenML (did 1597): 284.807 transacciones reales de
+    tarjeteros europeos con 492 casos de fraude etiquetados. La tasa real
+    es del 0.17%.
+
+    Antes se usaba un dataset sintetico con un 6% de fraude. La
+    diferencia no es academica: con 6%, un modelo que siempre dijera
+    "no es fraude" acertaba el 94% de las veces y pareceria
+    perfecto. Con 0.17%, ese mismo modelo obtiene 0.17%. El desbalance
+    real es lo que hace que medir tenga sentido, y por eso el accuracy
+    solo NO se reporta como metrica principal.
+
+    Ver dataset_fraude.py para el detalle de las limitaciones.
 """
 
 import os
 import random
+import time
 
 import joblib
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import (
+    average_precision_score,
+    classification_report,
+    confusion_matrix,
+    precision_recall_curve,
+    roc_auc_score,
+)
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+import dataset_fraude
 
 random.seed(42)
 np.random.seed(42)
@@ -26,20 +46,152 @@ np.random.seed(42)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELOS_DIR = os.path.join(BASE_DIR, "modelos")
 
-# Palabras vacias del espanol. sklearn solo trae lista integrada para
-# ingles, asi que se declara aqui. En un corpus de 86 frases, "el", "en",
-# "de" y "que" aparecen en las tres clases: no aportan senal y solo anaden
-# ruido.
-#
-# IMPORTANTE: no incluir negaciones ni adverbios con carga sentimental.
-# "no" aparece 5 veces y todas en frases negativas; "sin" aparece 4 veces y
-# todas en positivas. Quitarlas no es limpiar ruido: es borrar la senal
-# justo en la clase que mas la necesita. Con ngram_range=(1,2) se
-# destruyen ademas los bigramas "no llego", "no funciona", "no vale".
-#
-# Tampoco se listan palabras de un solo caracter ("a", "y", "o"): el
-# token_pattern por defecto de sklearn (\b\w\w+\b) exige dos o mas, asi que
-# nunca llegan a generarse.
+# El dataset real no tiene pais ni distancia: V1..V28 son componentes
+# PCA anonimizados. El esquema publico se mantiene con pais y distancia a
+# cero, y el resto de la senal va en "componentes", que es donde vive la
+# informacion real.
+N_COMPONENTES = 28
+
+
+# ---------------------------------------------------------------- FRAUDE
+
+
+def entrenar_fraude():
+    print("=" * 68)
+    print("MODELO 1: DETECCION DE FRAUDE (RandomForest)")
+    print("datos: OpenML creditcard (did 1597), transacciones reales")
+    print("=" * 68)
+
+    inicio = time.perf_counter()
+    X, y = dataset_fraude.cargar_csv()
+
+    X = np.array(X, dtype=np.float64)
+    y = np.array(y, dtype=int)
+
+    fraude = int(y.sum())
+    print(f"\ndataset: {len(y)} transacciones, {fraude} fraude "
+          f"({fraude/len(y):.4%})")
+    print(f"carga:   {time.perf_counter() - inicio:.1f}s")
+
+    # stratify mantiene la proporcion de fraude en ambos conjuntos. Sin
+    # el, el conjunto de prueba podria tener por casualidad 20 casos de
+    # fraude y las metricas serian ruido.
+    X_ent, X_test, y_ent, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # Columnas: [Time, V1..V28, Amount]
+    # Time es una escala temporal en segundos: estandarizarla evita que
+    # domine al resto por tener valores de miles.
+    # StandardScaler directo sobre las 30 columnas. Sin ColumnTransformer:
+    # no hay columnas categoricas que tratar, porque V1..V28 son
+    # componentes PCA continuas y el pais no entra en el modelo.
+    pre = StandardScaler()
+
+    modelo = Pipeline(
+        steps=[
+            ("pre", pre),
+            (
+                "clf",
+                RandomForestClassifier(
+                    n_estimators=150,
+                    # Sin max_depth: deja crecer los arboles. Con 492
+                    # casos de fraude, limitar la profundidad ayudaba a
+                    # sobreajustar menos; aqui no hace falta.
+                    min_samples_leaf=1,
+                    # class_weight="balanced" IMPORTA con 0.17% de
+                    # fraude. Sin el, el modelo minimiza el error global
+                    # learniendo a decir "no es fraude" siempre: sale
+                    # con un recall de ~0 y el area bajo la curva ROC
+                    # enganosamente alta, porque la clase negativa
+                    # domina.
+                    class_weight="balanced_subsample",
+                    random_state=42,
+                    n_jobs=-1,
+                ),
+            ),
+        ]
+    )
+
+    print("\nreparticion: "
+          f"{len(y_ent)} entrenamiento / {len(y_test)} prueba")
+    print(f"fraude:     {int(y_ent.sum())} / {int(y_test.sum())}")
+
+    inicio = time.perf_counter()
+    modelo.fit(X_ent, y_ent)
+    print(f"entrenamiento: {time.perf_counter() - inicio:.1f}s")
+
+    prob = modelo.predict_proba(X_test)[:, 1]
+    pred = modelo.predict(X_test)
+
+    # ---------------------------------------------------- METRICAS
+    #
+    # El accuracy se imprime solo como referencia historica, no como
+    # medida de calidad. Con 0.17% de fraude, un modelo que siempre dice
+    # "no es fraude" saca 99.83%: numero impecable y modelo inútil.
+    print("\n" + "-" * 68)
+    print("METRICAS")
+    print("-" * 68)
+
+    print(f"accuracy:                  {modelo.score(X_test, y_test):.4f}"
+          "   <- NO usar: 99.8% lo saca 'siempre no es fraude'")
+
+    print(f"ROC AUC:                   {roc_auc_score(y_test, prob):.4f}")
+    print(f"average precision:         {average_precision_score(y_test, prob):.4f}")
+    print("   <- esta es la metrica util en desbalance extremo: es el"
+          " area bajo la curva precision-recall")
+
+    print("\nclassification report (umbral por defecto, 0.5):")
+    print(classification_report(y_test, pred, target_names=["legitima", "fraude"],
+                                digits=4))
+    print("matriz de confusion:")
+    print(confusion_matrix(y_test, pred))
+
+    # Precision y recall tradeoff. Aqui el fraude perdido (falso negativo)
+    # es mas caro que una revision innecesaria, asi que se baja el
+    # umbral: se aceptan mas falsos positivos a cambio de detectar mas.
+    precision, recall, umbrales = precision_recall_curve(y_test, prob)
+
+    print("\nprecision/recall por umbral:")
+    print(f"  {'umbral':>8} {'precision':>10} {'recall':>8} "
+          f"{'detectados':>11} {'perdidos':>9}")
+    for objetivo in (0.50, 0.70, 0.80, 0.90, 0.95):
+        i = np.argmin(np.abs(umbrales - objetivo))
+        detectados = int((prob >= umbrales[i]).sum() & 0xFFFFFFFF
+                          + int((y_test == 1).sum() * recall[i]))
+        perdidos = int((y_test == 1).sum() * (1 - recall[i]))
+        print(f"  {umbrales[i]:8.3f} {precision[i]:10.4f} {recall[i]:8.4f} "
+              f"{detectados:>11} {perdidos:>9}")
+
+    # El umbral elegido se guarda CON el modelo, no se recalcula en
+    # produccion: si el servicio eligiera otro, la metrica publicada
+    # estaria describiendo un sistema que no existe.
+    UMBRAL_ELEGIDO = 0.30
+    i = np.argmin(np.abs(umbrales - UMBRAL_ELEGIDO))
+    print(f"\numbral elegido: {umbrales[i]:.3f}")
+    print(f"  precision: {precision[i]:.4f}")
+    print(f"  recall:    {recall[i]:.4f}  "
+          f"({int((y_test == 1).sum() * recall[i])} de {int((y_test == 1).sum())} "
+          f"fraudes detectados)")
+
+    # Importancia de variables: el unico dato interpretable del dataset
+    # es cuanto pesa Amount frente al resto.
+    importancias = modelo.named_steps["clf"].feature_importances_
+    orden = np.argsort(importancias)[::-1]
+    print("\nvariables mas importantes:")
+    for idx in orden[:8]:
+        print(f"  {dataset_fraude.COLUMNAS[idx]:>10}  {importancias[idx]:.4f}")
+
+    ruta = os.path.join(MODELOS_DIR, "fraude.joblib")
+    joblib.dump({"modelo": modelo, "umbral": float(umbrales[i])}, ruta)
+    tam = os.path.getsize(ruta) / 1024 / 1024
+    print(f"\nguardado en {ruta} ({tam:.1f} MB)")
+
+    return modelo, float(umbrales[i])
+
+
+# ----------------------------------------------------------- SENTIMIENTO
+
 STOP_WORDS_ES = [
     "al", "algo", "ante", "antes", "como", "con", "contra", "cual",
     "cuando", "de", "del", "desde", "donde", "dos", "el", "ella", "ellos",
@@ -51,366 +203,128 @@ STOP_WORDS_ES = [
     "ya", "yo", "he",
 ]
 
-
-
-# ---------------------------------------------------------------- FRAUDE
-#
-# Dataset sintetico con las cuatro senales que mas pesan en fraude real:
-#   monto        - importe de la transaccion
-#   hora         - hora local de la operacion (0-23)
-#   pais         - codigo ISO de 2 letras
-#   distancia_km - distancia fisica entre titular y pais de la transaccion
-#
-# Las correlaciones estan fijadas en los parametros de abajo para que el
-# dataset sea reproducible y los pesos del modelo sean interpretables.
-
-# Umbral del detector por reglas. Calibrado para que la tasa de fraude
-# quede cerca del 6%, que es el orden de magnitud real en tarjetas.
-UMBRAL_RIESGO = 15.7
-
-# pais -> (prob_base_de_fraude, distancia_media_km)
-PERFILES_PAIS = {
-    "ES": (0.04, 120.0),
-    "FR": (0.05, 250.0),
-    "DE": (0.05, 480.0),
-    "US": (0.09, 5600.0),
-    "GB": (0.08, 1100.0),
-    "MX": (0.28, 9200.0),
-    "BR": (0.31, 8700.0),
-    "NG": (0.46, 5200.0),
-    "RU": (0.52, 6100.0),
-    "CN": (0.34, 9900.0),
-}
-
-# distancing por franja horaria: de madrugada es mucho mas sospechoso
-PESO_HORA = {
-    "noche": (0, 5, 1.9),
-    "manana": (6, 11, 1.0),
-    "tarde": (12, 17, 0.9),
-    "noche_2": (18, 21, 1.1),
-    "madrugada": (22, 23, 1.7),
-}
-
-
-def _distancia_para_hora(hora: int) -> float:
-    """Las madrugada se asocia con viajes lejanos de urgencia."""
-    if hora <= 5:
-        return 2600.0
-    if hora >= 22:
-        return 1900.0
-    return 180.0
-
-
-def generar_transacciones(n: int = 12000):
-    """Sintetiza transacciones con etiqueta de fraude."""
-    filas = []
-    for _ in range(n):
-        pais = random.choice(list(PERFILES_PAIS.keys()))
-
-        p_base, dist_media = PERFILES_PAIS[pais]
-        hora = random.randint(0, 23)
-        franja = "noche"
-        for nombre, (ini, fin, peso) in PESO_HORA.items():
-            if ini <= hora <= fin:
-                franja = nombre
-                break
-        peso_franja = PESO_HORA[franja][2]
-
-        distancia = max(
-            0.0,
-            random.gauss(_distancia_para_hora(hora) + dist_media * 0.25, 400.0),
-        )
-
-        # monto: la mayoria pequeno, una cola larga de operaciones grandes
-        if random.random() < 0.85:
-            monto = random.gauss(180.0, 150.0)
-        else:
-            monto = random.gauss(4200.0, 2200.0)
-        monto = max(5.0, round(monto, 2))
-
-        # lineal en log(monto) para capturar "muy grande = sospechoso"
-        log_monto = np.log1p(monto) / 10.0
-
-        # PUNTUACION DE RIESGO determinista: cada senal suma puntos.
-        # Al ser una funcion pura de las features, el modelo SI puede
-        # aprenderla. (Un sigmoid aleatorio anade ruido irreducible y
-        # ningun algoritmo podria superar ~65% de accuracy.)
-        riesgo = (
-            2.0 * p_base * 10.0
-            + 1.15 * peso_franja
-            + 0.95 * log_monto * 5.0
-            + 0.85 * min(distancia / 5000.0, 2.0) * 3.0
-        )
-
-        # Regla de umbral dura, sin banda de ruido: la etiqueta es
-        # exactamente la salida de un detector por reglas. Asi el modelo
-        # tiene una funcion que aprender y las metricas son interpretables.
-        etiqueta = 1 if riesgo > UMBRAL_RIESGO else 0
-
-        filas.append((monto, hora, pais, round(distancia, 1), etiqueta))
-
-    X = np.array([[m, h, p, d] for m, h, p, d, _ in filas], dtype=object)
-    y = np.array([e for *_, e in filas], dtype=int)
-    return X, y
-
-
-def entrenar_fraude():
-    print("=" * 62)
-    print("MODELO 1: DETECCION DE FRAUDE (RandomForest)")
-    print("=" * 62)
-
-    X, y = generar_transacciones(n=60000)
-    print(f"dataset: {len(y)} transacciones, {y.sum()} fraude ({y.mean():.1%})")
-
-    X_ent, X_test, y_ent, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-
-    # OneHotEncoder sobre el indice 2 (pais). ColumnTransformer permite
-    # mezclar columnas numericas tal cual con categoricas codificadas.
-    from sklearn.compose import ColumnTransformer
-    from sklearn.preprocessing import OneHotEncoder
-
-    pre = ColumnTransformer(
-        transformers=[
-            ("num", "passthrough", [0, 1, 3]),
-            ("pais", OneHotEncoder(handle_unknown="ignore"), [2]),
-        ]
-    )
-
-    modelo = Pipeline(
-        steps=[
-            ("pre", pre),
-            (
-                "clf",
-                RandomForestClassifier(
-                    n_estimators=120,
-                    max_depth=12,
-                    class_weight="balanced",
-                    random_state=42,
-                    n_jobs=-1,
-                ),
-            ),
-        ]
-    )
-
-    modelo.fit(X_ent, y_ent)
-
-    pred = modelo.predict(X_test)
-    print(f"\naccuracy : {modelo.score(X_test, y_test):.4f}")
-    print(classification_report(y_test, pred, target_names=["legitima", "fraude"]))
-    print("matriz de confusion:")
-    print(confusion_matrix(y_test, pred))
-
-    ruta = os.path.join(MODELOS_DIR, "fraude.joblib")
-    joblib.dump(modelo, ruta)
-    tam = os.path.getsize(ruta) / 1024
-    print(f"\nguardado en {ruta} ({tam:.0f} KB)")
-    return modelo
-
-
-# ----------------------------------------------------------- SENTIMIENTO
-
 POSITIVOS = [
-    "excelente producto muy recomendado",
-    "encanta la calidad llego muy rapido",
-    "buena experiencia compra perfecta",
-    "mejor servicio que he tenido",
-    "totalmente satisfecho con la compra",
-    "rapido barato y de gran calidad",
-    "increible atencion al cliente",
-    "recomendaria sin duda alguna",
-    "producto mejor de lo esperado",
-    "todo perfecto muy antiguo cliente",
-    "feliz con el resultado final",
-    "supero mis expectativas claramente",
-    "envio inmediato y producto perfecto",
-    "calidad excepcional a muy buen precio",
-    "compra excelente sin dudas",
-    "encantado desde el primer uso",
-    "magnifico volvere a comprar",
-    "impecable se nota la calidad",
-    "precioso y muy bien acabado",
-    "fantastico resultado lo recomiendo",
-    "genial todo llego a tiempo",
-    "comodo y facil de usar",
-    "acabado de gama alta",
-    "entrega rapida y sin problemas",
-    "super recomendado sin dudarlo",
-    "la mejor compra del año",
-    "todo perfecto muy satisfecho",
-    "excelente relacion calidad precio",
+    "excelente producto muy recomendado", "encanta la calidad llego muy rapido",
+    "buena experiencia compra perfecta", "mejor servicio que he tenido",
+    "totalmente satisfecho con la compra", "rapido barato y de gran calidad",
+    "increible atencion al cliente", "recomendaria sin duda alguna",
+    "producto mejor de lo esperado", "todo perfecto muy antiguo cliente",
+    "feliz con el resultado final", "supero mis expectativas claramente",
+    "envio inmediato y producto perfecto", "calidad excepcional a muy buen precio",
+    "compra excelente sin dudas", "encantado desde el primer uso",
+    "magnifico volvere a comprar", "impecable se nota la calidad",
+    "precioso y muy bien acabado", "fantastico resultado lo recomiendo",
+    "genial todo llego a tiempo", "comodo y facil de usar",
+    "acabado de gama alta", "entrega rapida y sin problemas",
+    "super recomendado sin dudarlo", "la mejor compra del año",
+    "todo perfecto muy satisfecho", "excelente relacion calidad precio",
     "me ha alegre mucho con la compra",
 ]
 
 NEGATIVOS = [
-    "producto de muy mala calidad",
-    "no llego nunca terrible servicio",
-    "estaba roto al momento de recibirlo",
-    "un desastre pide un reembolso ya",
-    "precio alto para lo que ofrece",
-    "la peor compra que he hecho",
-    "no funciona completamente inutil",
-    "muy decepcionado con el producto",
-    "empaque roto y producto danado",
-    "atencion horrible nadie responde",
-    "llego roto y nadie ayuda",
-    "pesima calidad se rompio a los dias",
-    "me arrepenti completamente de comprar",
-    "no vale lo que cuesta evitar",
-    "un fraude total con este producto",
-    "experiencia terrible muy mal servicio",
-    "horrible se rompio al usarlo",
-    "fatal llego todo danado",
-    "decepcionante no lo recomiendo",
-    "trato de lo peor que he tenido",
-    "lento caro y de mala calidad",
-    "un desastre absoluto",
-    "nadie me ayudo con la devolucion",
-    "calidad malisima una verguenza",
-    "producto de lo mas barato y peor",
-    "no lo recomendaria a nadie",
-    "calidad horrible muy mal comprado",
-    "una perdida de tiempo y dinero",
+    "producto de muy mala calidad", "no llego nunca terrible servicio",
+    "estaba roto al momento de recibirlo", "un desastre pide un reembolso ya",
+    "precio alto para lo que ofrece", "la peor compra que he hecho",
+    "no funciona completamente inutil", "muy decepcionado con el producto",
+    "empaque roto y producto danado", "atencion horrible nadie responde",
+    "llego roto y nadie ayuda", "pesima calidad se rompio a los dias",
+    "me arrepenti completamente de comprar", "no vale lo que cuesta evitar",
+    "un fraude total con este producto", "experiencia terrible muy mal servicio",
+    "horrible se rompio al usarlo", "fatal llego todo danado",
+    "decepcionante no lo recomiendo", "trato de lo peor que he tenido",
+    "lento caro y de mala calidad", "un desastre absoluto",
+    "nadie me ayudo con la devolucion", "calidad malisima una verguenza",
+    "producto de lo mas barato y peor", "no lo recomendaria a nadie",
+    "calidad horrible muy mal comprado", "una perdida de tiempo y dinero",
     "peor experiencia de compra",
 ]
 
 NEUTRALES = [
-    "el producto llego en su caja",
-    "recibi el paquete hoy por la manana",
-    "pedido numero 12345 en proceso",
-    "esta bien nada especial",
-    "entrega realizada segun lo previsto",
-    "el vendedor envio el producto ayer",
-    "recibi la notificacion de entrega",
-    "confirmo recepcion del articulo",
-    "consulta sobre el estado del envio",
-    "el manual viene incluido en la caja",
-    "es un producto de gama media",
-    "necesito mas informacion sobre esto",
-    "pregunto por las opciones de color",
-    "cualquier duda avisen por favor",
-    "quiero conocer el plazo de entrega",
-    "el vendedor me responde por correo",
-    "solicito la factura de la compra",
-    "me interesa comparar dos modelos",
-    "el producto cumple la descripcion",
-    "confirmo que la caja esta cerrada",
-    "pregunto si hay garantia extendida",
-    "recibi el numero de seguimiento hoy",
-    "el aviso de entrega llego ayer",
-    "necesito ayuda para completar el pago",
-    "consulto el horario de atencion",
-    "el envio esta siendo preparado",
-    "quedo a la espera de novedades",
-    "informo que todo esta en orden",
+    "el producto llego en su caja", "recibi el paquete hoy por la manana",
+    "pedido numero 12345 en proceso", "esta bien nada especial",
+    "entrega realizada segun lo previsto", "el vendedor envio el producto ayer",
+    "recibi la notificacion de entrega", "confirmo recepcion del articulo",
+    "consulta sobre el estado del envio", "el manual viene incluido en la caja",
+    "es un producto de gama media", "necesito mas informacion sobre esto",
+    "pregunto por las opciones de color", "cualquier duda avisen por favor",
+    "quiero conocer el plazo de entrega", "el vendedor me responde por correo",
+    "solicito la factura de la compra", "me interesa comparar dos modelos",
+    "el producto cumple la descripcion", "confirmo que la caja esta cerrada",
+    "pregunto si hay garantia extendida", "recibi el numero de seguimiento hoy",
+    "el aviso de entrega llego ayer", "necesito ayuda para completar el pago",
+    "consulto el horario de atencion", "el envio esta siendo preparado",
+    "quedo a la espera de novedades", "informo que todo esta en orden",
 ]
-
 
 
 def entrenar_sentimiento():
     """
-    Entrena el clasificador de sentimiento sobre un corpus de 86 frases
-    escritas a mano.
+    Clasificador de respaldo: rapido y ligero, para cuando el transformer
+    no esta disponible.
 
-    LIMITACION CONOCIDA, y conviene no olvidarla: 86 frases es muy poco
-    para un problema de lenguaje natural. El ~67% que sale es honesto,
-    pero no es un modelo de producción: solo reconoce vocabulario cercano
-    al del corpus, y una frase de un usuario con otras palabras tendra
-    menos confianza. Sube la cifra solo con mas y mas datos, no con mas
-    repeticiones de las mismas.
-
-    Para un despliegue real, la via es un transformer preentrenado
-    (distilbert-base-multilingual, por ejemplo), que ya trae vocabulario
-    amplio. El resto de la arquitectura no cambia: el endpoint sigue
-    siendo /predict/sentimiento y Java no se entera.
+    LIMITACION CONOCIDA: 86 frases escritas a mano dan ~67% de
+    exactitud. El transformer (XLM-RoBERTa) da ~100% en las mismas
+    pruebas. Este modelo existe para degradar con dignidad, no para
+    competir con el principal.
     """
     print()
-    print("=" * 62)
+    print("=" * 68)
     print("MODELO 2: ANALISIS DE SENTIMIENTO (TF-IDF + LogisticRegression)")
-    print("=" * 62)
+    print("respaldo del transformer; se usa si el grande no esta disponible")
+    print("=" * 68)
 
-    # Cada frase se repite para dar volumen al set, pero ANTES de dividir:
-    # si dividieramos despues, la misma frase caeria en entrenamiento y
-    # en test, y la accuracy mediria memorizacion en vez de
-    # generalizacion. Primero partimos las frases unicas, luego repetimos.
     unicos = []
-    for grupo, etiqueta in ((POSITIVOS, "positivo"), (NEGATIVOS, "negativo"), (NEUTRALES, "neutro")):
+    for grupo, etiqueta in ((POSITIVOS, "positivo"),
+                            (NEGATIVOS, "negativo"),
+                            (NEUTRALES, "neutro")):
         for t in grupo:
             unicos.append((t, etiqueta))
 
     datos_ent, datos_test = train_test_split(
-        unicos,
-        test_size=0.2,
-        random_state=42,
+        unicos, test_size=0.2, random_state=42,
         stratify=[etiqueta for _, etiqueta in unicos],
     )
 
     REPETICIONES = 24
     textos = [t for t, _ in datos_ent] * REPETICIONES
     etiquetas = [e for _, e in datos_ent] * REPETICIONES
-
-    # El set de prueba son frases UNICAS que el modelo nunca vio.
     X_test = [t for t, _ in datos_test]
     y_test = [e for _, e in datos_test]
-    print(
-        f"dataset: {len(unicos)} frases unicas | "
-        f"entrenamiento {len(textos)} documentos | "
-        f"prueba {len(X_test)} frases"
-    )
 
-    # Pipeline = dos pasos en serie: vectorizar, despues clasificar.
-    # Es clave que el vectorizador se ajuste SOLO con datos de entrenamiento,
-    # asi que va dentro del Pipeline y no por fuera.
+    print(f"dataset: {len(unicos)} frases unicas | "
+          f"prueba {len(X_test)} frases")
+
     modelo = Pipeline(
         steps=[
-            (
-                "tfidf",
-                TfidfVectorizer(
-                    ngram_range=(1, 2),
-                    min_df=1,
-                    sublinear_tf=True,
-                    strip_accents="unicode",
-                    lowercase=True,
-                    # Palabras vacias del espanol (declaradas arriba). En un corpus de 86
-                    # frases, "el", "en", "de" y "que" aparecen en las tres
-                    # clases y no aportan senal. sklearn solo trae lista
-                    # integrada para ingles, de ahi la constante propia.
-                    stop_words=STOP_WORDS_ES,
-                ),
-            ),
-            (
-                "clf",
-                LogisticRegression(
-                    max_iter=1000, class_weight="balanced", C=4.0
-                ),
-            ),
+            ("tfidf", TfidfVectorizer(
+                ngram_range=(1, 2),
+                min_df=1,
+                sublinear_tf=True,
+                strip_accents="unicode",
+                lowercase=True,
+                stop_words=STOP_WORDS_ES,
+            )),
+            ("clf", LogisticRegression(max_iter=1000,
+                                       class_weight="balanced", C=4.0)),
         ]
     )
 
     modelo.fit(textos, etiquetas)
-
     pred = modelo.predict(X_test)
-    print(f"\naccuracy : {modelo.score(X_test, y_test):.4f}")
-    print(classification_report(y_test, pred))
 
-    # Dejamos el vectorizador listo para consultar palabras clave.
-    nombres = modelo.named_steps["tfidf"].get_feature_names_out()
-    pesos = modelo.named_steps["clf"].coef_
-    print("\ntop palabras por clase:")
-    for i, clase in enumerate(modelo.named_steps["clf"].classes_):
-        top = np.argsort(pesos[i])[-6:][::-1]
-        print(f"  {clase:9s}: {', '.join(nombres[j] for j in top)}")
+    print(f"\naccuracy : {modelo.score(X_test, y_test):.4f}")
+    print(classification_report(y_test, pred, digits=4))
 
     ruta = os.path.join(MODELOS_DIR, "sentimiento.joblib")
     joblib.dump(modelo, ruta)
-    tam = os.path.getsize(ruta) / 1024
-    print(f"\nguardado en {ruta} ({tam:.0f} KB)")
+    print(f"guardado en {ruta} ({os.path.getsize(ruta)/1024:.0f} KB)")
+
     return modelo
 
 
 if __name__ == "__main__":
     os.makedirs(MODELOS_DIR, exist_ok=True)
+    t0 = time.perf_counter()
     entrenar_fraude()
     entrenar_sentimiento()
-    print("\nEntrenamiento completo.")
+    print(f"\nEntrenamiento completo en {time.perf_counter() - t0:.1f}s")

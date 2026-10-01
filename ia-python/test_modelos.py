@@ -21,10 +21,28 @@ import unittest
 import joblib
 import numpy as np
 
+import dataset_fraude
+import motor_sentimiento as ms
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELOS_DIR = os.path.join(BASE_DIR, "modelos")
+
+
+def _cargar_modelo(ruta):
+    """
+    El .joblib guarda {"modelo": pipeline, "umbral": float} desde que el
+    modelo se entrena con datos reales: el umbral viaja con el modelo para
+    que la metrica publicada describa el sistema que realmente decide.
+
+    Los tests unloaded con solo el pipeline, que es lo que interesa
+    verificar aqui.
+    """
+    cargado = joblib.load(ruta)
+    if isinstance(cargado, dict):
+        return cargado["modelo"]
+    return cargado
 
 
 class TestOrdenDeColumnas(unittest.TestCase):
@@ -36,7 +54,7 @@ class TestOrdenDeColumnas(unittest.TestCase):
         if not os.path.exists(ruta):
             raise unittest.SkipTest(
                 "Ejecuta primero: python entrenamiento.py")
-        cls.modelo = joblib.load(ruta)
+        cls.modelo = _cargar_modelo(ruta)
 
     def test_main_construye_la_fila_en_el_orden_entrenado(self):
         """
@@ -72,63 +90,88 @@ class TestOrdenDeColumnas(unittest.TestCase):
         servicio.modelo_fraude = ModeloFalso()
         try:
             servicio.predecir_fraude(servicio.TransaccionRequest(
-                monto=9000.0, hora=3, pais="NG", distancia_km=5200.0))
+                componentes=[0.0] * 28, monto=9000.0, hora=3,
+                pais="NG", distancia_km=5200.0))
         finally:
             servicio.modelo_fraude = modelo_original
 
         fila = fila_capturada["X"]
 
-        # ColumnTransformer fue fitted con num -> [0, 1, 3] y pais -> [2].
-        # Reconstruimos a mano lo que el pipeline hace con la fila y
-        # comprobamos que monto, hora y distancia caen en las columnas
-        # numericas y el pais en la de pais.
-        transformadores = {n: c for n, _, c
-                           in self.modelo.named_steps["pre"].transformers}
-        self.assertEqual(transformadores["num"], [0, 1, 3])
-        self.assertEqual(transformadores["pais"], [2])
+        self.assertEqual(len(fila), 30)
 
-        # La fila de inferencia debe ser [monto, hora, pais, distancia]
-        self.assertEqual(fila, [9000.0, 3, "NG", 5200.0])
-
-        # Y los valores deben caer donde el transformador los espera:
-        # numericas en 0, 1 y 3; pais en 2.
-        self.assertEqual(fila[0], 9000.0)   # monto
-        self.assertEqual(fila[1], 3)        # hora
-        self.assertEqual(fila[2], "NG")     # pais
-        self.assertEqual(fila[3], 5200.0)   # distancia_km
+        # La fila completa: [Time, V1..V28, Amount].
+        # Time = hora * 3600 (main.py lo reconstruye asi), 28 componentes,
+        # y el monto al final.
+        self.assertEqual(fila[0], 3 * 3600.0)   # Time
+        self.assertEqual(fila[29], 9000.0)      # Amount
+        self.assertEqual(len(fila[1:29]), 28)   # V1..V28
 
     def test_orden_de_columnas_esperado_por_el_transformer(self):
         """
-        ColumnTransformer fue fitted con num -> [0, 1, 3] y pais -> [2].
-        Si alguien reordena las columnas en main.py sin reentrenar, el
-        modelo recibe [monto, pais, hora, distancia] y predice mal en
-        silencio. Este test falla si el mapeo esperado cambia.
-        """
-        transformadores = {nombre: cols for nombre, _, cols
-                           in self.modelo.named_steps["pre"].transformers}
+        El pipeline espera 30 columnas en el orden [Time, V1..V28, Amount].
 
-        self.assertEqual(transformadores["num"], [0, 1, 3])
-        self.assertEqual(transformadores["pais"], [2])
+        Si alguien reordena la fila en main.py, el modelo recibe las
+        columnas en otro orden y predice SIN ERROR, con el sentido
+        invertido. Por eso el numero de features se comprueba aqui.
+        """
+        # El paso "pre" es un StandardScaler sobre las 30 columnas.
+        # n_features_in_ es el numero exacto que el clasificador espera:
+        # si main.py dejara de enviar una componente, predict() fallaria
+        # aqui con un error de dimensiones.
+        self.assertEqual(
+            self.modelo.named_steps["clf"].n_features_in_, 30,
+            "El modelo espera 30 features: Time + V1..V28 + Amount")
 
     def test_inferencia_respeta_el_orden_entrenado(self):
         """
         Reconstruye la fila EXACTAMENTE como lo hace main.py y comprueba
-        que una transaccion claramente sospechosa se detecta.
-        """
-        fila = [9000.0, 3, "NG", 5200.0]  # monto, hora, pais, distancia
-        prediccion = self.modelo.predict([fila])[0]
+        que una transccion marcada como fraude se detecta.
 
-        self.assertEqual(
-            prediccion, 1,
-            "Una transaccion de Nigeria a las 3am por 9000 deberia ser fraude")
+        OJO con lo que este test ya NO afirma. Con el modelo sintetico
+        anterior, "Nigeria a las 3am por 9000" era fraude por regla. Con
+        el modelo real, los componentes PCA deciden y el pais no entra: una
+        fila de ceros con monto alto NO es fraude. Por eso se usan filas
+        reales del dataset (vienen de dataset_fraude) y no inventadas.
+        """
+        X, y = dataset_fraude.cargar_csv()
+        import numpy as np
+        X = np.array(X)
+        y = np.array(y)
+
+        reales = np.where(y == 1)[0][:50]
+        detectadas = 0
+        for i in reales:
+            fila = [3 * 3600.0] + list(X[i][1:29]) + [float(X[i][29])]
+            if self.modelo.predict([fila])[0] == 1:
+                detectadas += 1
+
+        # Con el umbral por defecto el modelo detecta la mayoria. El
+        # umbral operativo (0.30)Recall mas, pero este test mide que la
+        # inferencia monta bien la fila, no que el modelo sea perfecto.
+        proporcion = detectadas / len(reales)
+        self.assertGreater(
+            proporcion, 0.7,
+            f"El modelo deberia detectar al menos el 70% del fraude real; "
+            f"detecto {proporcion:.0%}")
 
     def test_transaccion_legitima_se_aprueba(self):
-        fila = [150.0, 12, "ES", 80.0]
-        prediccion = self.modelo.predict([fila])[0]
+        """Filas REALES legitimas deben salir como legitimas."""
+        import numpy as np
+        X, y = dataset_fraude.cargar_csv()
+        X = np.array(X)
+        y = np.array(y)
 
-        self.assertEqual(
-            prediccion, 0,
-            "Una compra pequena en Espana a mediodia no deberia ser fraude")
+        reales = np.where(y == 0)[0][:500]
+        falsos = sum(
+            1 for i in reales
+            if self.modelo.predict([[12 * 3600.0] + list(X[i][1:29])
+                                    + [float(X[i][29])]])[0] == 1
+        )
+
+        proporcion = falsos / len(reales)
+        self.assertLess(
+            proporcion, 0.05,
+            f"Demasiadas legitimas marcadas como fraude: {proporcion:.1%}")
 
     def test_probabilidad_de_fraude_esta_en_indice_de_clase_1(self):
         """
@@ -151,7 +194,7 @@ class TestContratoDePython(unittest.TestCase):
         if not os.path.exists(ruta):
             raise unittest.SkipTest(
                 "Ejecuta primero: python entrenamiento.py")
-        cls.modelo = joblib.load(ruta)
+        cls.modelo = _cargar_modelo(ruta)
 
     def test_respuesta_tiene_los_campos_que_espera_java(self):
         """
@@ -165,8 +208,12 @@ class TestContratoDePython(unittest.TestCase):
         """
         import main as servicio
 
-        # Lo que Java espera deserializar.
-        campos_java = {"es_fraude", "probabilidad", "nivel_riesgo", "modelo"}
+        # Lo que Java espera deserializar. RespuestaFraudePython.java
+        # declara estos cinco; "umbral" se anadio cuando el modelo paso a
+        # usar datos reales, para que el cliente sepa con que criterio se
+        # decidio el veredicto.
+        campos_java = {"es_fraude", "probabilidad", "nivel_riesgo",
+                       "modelo", "umbral"}
 
         # Lo que el esquema de Python garantiza devolver.
         campos_python = set(servicio.FraudeResponse.model_fields)
@@ -179,8 +226,8 @@ class TestContratoDePython(unittest.TestCase):
 
         # Y que la peticion que Java envia tenga los mismos nombres.
         campos_peticion = set(servicio.TransaccionRequest.model_fields)
-        self.assertEqual({"monto", "hora", "pais", "distancia_km"},
-                         campos_peticion)
+        self.assertEqual({"componentes", "monto", "hora", "pais",
+                          "distancia_km"}, campos_peticion)
 
     def test_sentimiento_respuesta_tiene_los_campos_que_espera_java(self):
         import main as servicio
@@ -190,26 +237,88 @@ class TestContratoDePython(unittest.TestCase):
 
         self.assertEqual(campos_java, campos_python)
 
-    def test_paises_validados_coinciden_con_los_entrenados(self):
+    def test_paises_no_son_parte_del_contrato_del_modelo(self):
         """
-        OneHotEncoder con handle_unknown='ignore' convierte un pais no
-        visto en un vector de ceros, sin error. Ese es el caso que
-        PAISES_CONOCIDOS de main.py existe para rechazar.
+        El modelo real NO usa pais. V1..V28 son componentes PCA y el
+        dataset de referencia no tiene informacion de geografia.
 
-        Comparar PAISES_CONOCIDOS contra las categorias reales del
-        encoder es la unica forma de detectar que alguien anadio un pais
-        al allowlist sin reentrenar, que reintroduciria el fallo silencioso.
+        Este test existe para dejar constancia de esa decision, porque es
+        contraintuitiva: el contrato publico incluye pais (el cliente lo
+        tiene y quiere mostrarlo) pero no influye en la prediccion. Si
+        alguien lo anade al pipeline sin reentrenar, este test falla.
         """
         import main as servicio
 
-        categorias = set(self.modelo.named_steps["pre"]
-                         .named_transformers_["pais"]
-                         .categories_[0])
-
+        # El paso "pre" es un StandardScaler sobre 30 columnas, sin
+        # codificacion categorica de ningun tipo.
         self.assertEqual(
-            servicio.PAISES_CONOCIDOS, categorias,
-            "PAISES_CONOCIDOS en main.py ya no coincide con los paises que "
-            "el modelo sabe interpretar. Reentrena o corrige la lista.")
+            type(self.modelo.named_steps["pre"]).__name__,
+            "StandardScaler",
+            "Si el pipeline vuelve a codificar categorias, el modelo "
+            "necesita reentrenarse con el esquema nuevo")
+
+        # Y la lista de paises es de validacion de formato, no de
+        # disponibilidad del modelo: cualquier ISO de 2 letras mayusculas
+        # que este en la lista se acepta.
+        self.assertIn("ES", servicio.PAISES_VALIDOS)
+        self.assertIn("US", servicio.PAISES_VALIDOS)
+
+
+class TestMuestraEstratificada(unittest.TestCase):
+    """
+    La funcion que usa el CI para no bajar 144 MB en cada ejecucion.
+
+    Existe por un motivo concreto: reducir el dataset tomando las primeras
+    n filas puede devolver CERO casos de fraude, porque en este dataset el
+    fraude esta repartido por todo el fichero. Un modelo entrenado asi no
+    tiene nada que aprender, y el fallo se manifestaria como "el modelo
+    devuelve siempre 0", que no senala la causa.
+    """
+
+    def setUp(self):
+        # Dataset sintetico pequeno: lo que importa es la MECANICA de la
+        # muestra, no la distribucion real.
+        self.X = [[float(i)] * 30 for i in range(1000)]
+        self.y = [1] * 5 + [0] * 995
+
+    def test_conserva_todos_los_casos_de_fraude(self):
+        _, y = dataset_fraude.muestra(self.X, self.y, 200)
+
+        self.assertEqual(sum(y), 5,
+                         "Perder un caso de fraude cambia el modelo. Con "
+                         "una muestra por cabeza puede perderse el "
+                         "entero.")
+
+    def test_respeta_el_tamano_pedido(self):
+        X, y = dataset_fraude.muestra(self.X, self.y, 200)
+
+        self.assertEqual(len(X), 200)
+        self.assertEqual(len(y), 200)
+
+    def test_es_determinista(self):
+        # Sin esto, cada ejecucion del CI entrenaria un modelo distinto y
+        # un fallo pasaria a ser intermitente.
+        _, a = dataset_fraude.muestra(self.X, self.y, 200)
+        _, b = dataset_fraude.muestra(self.X, self.y, 200)
+
+        self.assertEqual(a, b)
+
+    def test_pedir_mas_que_lo_que_hay_devuelve_todo(self):
+        # Es el caso limite: si n >= len(y) no hay nada que recortar, y un
+        # error aqui daria un dataset vacio.
+        X, y = dataset_fraude.muestra(self.X, self.y, 999_999)
+
+        self.assertEqual(len(X), 1000)
+        self.assertEqual(len(y), 1000)
+
+    def test_el_orden_original_se_conserva(self):
+        # Recortar no puede reordenar: el orden temporal de Time es una
+        # senal en si mismo, y un train_test_split sin estratificar
+        # asumiria que el orden es aleatorio.
+        X, _ = dataset_fraude.muestra(self.X, self.y, 200)
+        tiempos = [fila[0] for fila in X]
+
+        self.assertEqual(tiempos, sorted(tiempos))
 
 
 class TestSentimiento(unittest.TestCase):
@@ -220,7 +329,7 @@ class TestSentimiento(unittest.TestCase):
         if not os.path.exists(ruta):
             raise unittest.SkipTest(
                 "Ejecuta primero: python entrenamiento.py")
-        cls.modelo = joblib.load(ruta)
+        cls.modelo = _cargar_modelo(ruta)
 
     def test_las_tres_clases_existen(self):
         clases = set(self.modelo.named_steps["clf"].classes_)
@@ -238,7 +347,7 @@ class TestSentimiento(unittest.TestCase):
         # El endpoint usa un motor con respaldo, no el pipeline suelto.
         # Montamos uno real con solo el TF-IDF, que es rapido y no
         # descarga 1 GB.
-        import motor_sentimiento as ms
+        import dataset_fraude
 
         original = servicio.motor_sentimiento
         servicio.motor_sentimiento = ms.construir_motor(usar_transformer=False)

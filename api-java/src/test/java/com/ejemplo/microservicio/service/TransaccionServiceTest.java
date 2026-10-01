@@ -13,6 +13,7 @@ import com.ejemplo.microservicio.dto.SolicitudTransaccion;
 import com.ejemplo.microservicio.domain.Usuario;
 import com.ejemplo.microservicio.repository.UsuarioRepository;
 import com.ejemplo.microservicio.exception.ServicioIANoDisponibleException;
+import com.ejemplo.microservicio.exception.UsuarioNoEncontradoException;
 import java.math.BigDecimal;
 import java.util.Optional;
 import org.junit.jupiter.api.DisplayName;
@@ -73,8 +74,16 @@ class TransaccionServiceTest {
                 "Usuario Test", "contrasena-larga-123");
     }
 
+    /** 28 componentes PCA, como espera el modelo. */
+    private static java.util.List<Double> componentes() {
+        return java.util.stream.IntStream.range(0, 28)
+                .mapToObj(i -> 1.234)
+                .toList();
+    }
+
     private static SolicitudTransaccion transaccion() {
-        return new SolicitudTransaccion(9000.0, 3, "NG", 5200.0);
+        return new SolicitudTransaccion(
+                componentes(), 9000.0, 3, "NG", 5200.0);
     }
 
     @Test
@@ -82,7 +91,7 @@ class TransaccionServiceTest {
     void guardaConVeredicto() throws Exception {
         Usuario u = usuarioDePrueba();
         when(clienteIA.predecirFraude(any())).thenReturn(
-                new RespuestaFraudePython(true, 0.93, "critico", "rf"));
+                new RespuestaFraudePython(true, 0.93, "critico", "rf", 0.30));
 
         var r = servicio.analizarYGuardar(u.getId(), transaccion());
 
@@ -165,7 +174,7 @@ class TransaccionServiceTest {
     void historialOrdenaYPagina() throws Exception {
         Usuario u = usuarioDePrueba();
         when(clienteIA.predecirFraude(any())).thenReturn(
-                new RespuestaFraudePython(false, 0.01, "bajo", "rf"));
+                new RespuestaFraudePython(false, 0.01, "bajo", "rf", 0.30));
 
         for (int i = 0; i < 5; i++) {
             servicio.analizarYGuardar(u.getId(), transaccion());
@@ -189,11 +198,11 @@ class TransaccionServiceTest {
     void filtroSoloFraude() throws Exception {
         Usuario u = usuarioDePrueba();
         when(clienteIA.predecirFraude(any()))
-                .thenReturn(new RespuestaFraudePython(false, 0.01, "bajo", "rf"));
+                .thenReturn(new RespuestaFraudePython(false, 0.01, "bajo", "rf", 0.30));
         servicio.analizarYGuardar(u.getId(), transaccion());
 
         when(clienteIA.predecirFraude(any()))
-                .thenReturn(new RespuestaFraudePython(true, 0.95, "critico", "rf"));
+                .thenReturn(new RespuestaFraudePython(true, 0.95, "critico", "rf", 0.30));
         servicio.analizarYGuardar(u.getId(), transaccion());
 
         var soloFraude = repositorio.buscar(u.getId(), true,

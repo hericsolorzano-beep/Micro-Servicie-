@@ -1,26 +1,29 @@
 package com.ejemplo.microservicio;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.ejemplo.microservicio.security.EmisorDeToken;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
-import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.jdbc.JdbcConnectionDetails;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
-import org.springframework.boot.autoconfigure.jdbc.JdbcConnectionDetails;
 import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 
 /**
  * INTEGRACION DE VERDAD: Java -> Python -> PostgreSQL, todo real.
@@ -47,8 +50,7 @@ import org.springframework.test.web.servlet.MockMvc;
                 // migracion real y Hibernate comprueba que las entidades
                 // encajen. Es el mismo camino que produccion.
                 "spring.jpa.hibernate.ddl-auto=validate",
-        "spring.flyway.enabled=true",
-        "seguridad.activada=false"
+        "spring.flyway.enabled=true"
 })
 // ORDEN DE EJECUCION FIJADO A PROPOSITO.
 //
@@ -67,6 +69,9 @@ class IntegracionCompletaTest {
     @Autowired
     private MockMvc mockMvc;
 
+    @Autowired
+    private EmisorDeToken emisor;
+
     /** Reinicia el circuito entre tests, para que ninguno herede estado. */
     @Autowired
     private io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry breakerRegistry;
@@ -83,6 +88,26 @@ class IntegracionCompletaTest {
 
     private final ObjectMapper json = new ObjectMapper();
 
+    // ------------------------------------------------------- AUTENTICACION
+
+    /**
+     * Peticion POST con un token de sesion del usuario indicado.
+     *
+     * El token lo emite el EmisorDeToken real y lo verifica el JwtDecoder
+     * real del contexto, con la misma clave. No se falsea nada, asi que
+     * estos tests recorren la autenticacion entera.
+     */
+    private MockHttpServletRequestBuilder postConToken(String ruta, long usuarioId) {
+        return post(ruta).contentType(MediaType.APPLICATION_JSON)
+                .header("Authorization",
+                        "Bearer " + emisor.emitir(usuarioId, "u@ejemplo.com"));
+    }
+
+    private MockHttpServletRequestBuilder getConToken(String ruta, long usuarioId) {
+        return get(ruta).header("Authorization",
+                "Bearer " + emisor.emitir(usuarioId, "u@ejemplo.com"));
+    }
+
     // ------------------------------------------------------- FRAUDE
 
     @Order(1)
@@ -90,25 +115,23 @@ class IntegracionCompletaTest {
     @DisplayName("Fraude: transaccion sospechosa detectada de punta a punta")
     void fraudeSospechoso() throws Exception {
         String cuerpo = """
-                {"monto":9000,"hora":3,"pais":"NG","distancia_km":5200}""";
+                {"componentes":[-9.1698,7.0922,-12.354,4.2431,-7.1764,-3.3866,-8.058,6.4429,-2.413,-6.1349,2.8267,-6.3098,-0.623,-7.2799,0.9242,-4.2155,-7.1717,-2.5503,0.5964,0.8167,0.9262,-0.8177,-0.1504,-0.0394,0.4856,-0.2643,1.1597,0.2328],"monto":99.99,"hora":3,"pais":"NG","distancia_km":5200}""";
 
-        mockMvc.perform(post("/api/transacciones")
-                        .contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(postConToken("/api/transacciones", 1L)
                         .content(cuerpo))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.es_fraude").value(true))
-                .andExpect(jsonPath("$.accion").value("BLOQUEADA"))
-                .andExpect(jsonPath("$.nivel_riesgo").value("critico"));
+                .andExpect(jsonPath("$.accion").value("REQUIERE_REVISION"))
+                .andExpect(jsonPath("$.nivel_riesgo").value("alto"));
     }
 
     @Order(2)
     @Test
     @DisplayName("Fraude: transaccion legitima aprobada")
     void fraudeLegitimo() throws Exception {
-        mockMvc.perform(post("/api/transacciones")
-                        .contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(postConToken("/api/transacciones", 1L)
                         .content("""
-                                {"monto":150,"hora":12,"pais":"ES","distancia_km":80}"""))
+                                {"componentes":[-0.2743,0.1401,2.227,-0.3606,-0.397,-0.6929,0.0618,-0.3533,-1.699,0.7048,0.0971,-0.5307,1.2179,-0.5407,1.5355,0.3505,0.7263,-1.3437,2.464,0.5843,-0.0503,-0.0985,-0.1118,0.3975,-0.0495,-0.2278,-0.0697,-0.1301],"monto":12.0,"hora":12,"pais":"ES","distancia_km":80}"""))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.es_fraude").value(false))
                 .andExpect(jsonPath("$.accion").value("APROBADA"));
@@ -122,10 +145,9 @@ class IntegracionCompletaTest {
         // rechazo explicito de PAISES_CONOCIDOS, JP pasaria al vector de
         // ceros y devolveria una prediccion sin senal del pais, con total
         // aspecto de correcta.
-        mockMvc.perform(post("/api/transacciones")
-                        .contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(postConToken("/api/transacciones", 1L)
                         .content("""
-                                {"monto":100,"hora":12,"pais":"JP","distancia_km":9000}"""))
+                                {"componentes":[1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234],"monto":100,"hora":12,"pais":"ZZ","distancia_km":9000}"""))
                 .andExpect(status().isServiceUnavailable())
                 .andExpect(jsonPath("$.codigo").value("IA_NO_DISPONIBLE"));
     }
@@ -149,8 +171,7 @@ class IntegracionCompletaTest {
         };
 
         for (var caso : casos) {
-            String respuesta = mockMvc.perform(post("/api/texto")
-                            .contentType(MediaType.APPLICATION_JSON)
+            String respuesta = mockMvc.perform(postConToken("/api/texto", 1L)
                             .content(json.writeValueAsString(
                                     java.util.Map.of("texto", caso.texto()))))
                     .andExpect(status().isOk())
@@ -174,10 +195,11 @@ class IntegracionCompletaTest {
 
     @Order(5)
     @Test
-    @DisplayName("Alta de usuario, transaccion y consulta con los tres servicios")
+    @DisplayName("Alta, login, transaccion y consulta con los tres servicios")
     void flujoCompleto() throws Exception {
-        // 1. Usuario
-        String usuarioJson = mockMvc.perform(post("/api/v1/usuarios")
+        // 1. Alta de usuario (ruta publica: todavia no hay token)
+        String usuarioJson = mockMvc.perform(
+                        post("/api/v1/sesiones/usuarios")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"email":"integ@ejemplo.com","nombre":"Integ Test",
@@ -190,18 +212,35 @@ class IntegracionCompletaTest {
 
         long usuarioId = json.readTree(usuarioJson).get("id").asLong();
 
-        // 2. Transaccion sospechosa: IA + escritura en la BD real
-        mockMvc.perform(post("/api/v1/usuarios/" + usuarioId + "/transacciones")
+        // 2. Login: la contrasena en claro se cambia por un token
+        String token = mockMvc.perform(post("/api/v1/sesiones/login")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
-                                {"monto":9000,"hora":3,"pais":"NG","distancia_km":5200}"""))
+                                {"email":"integ@ejemplo.com",
+                                 "contrasena":"contrasena-larga-123"}"""))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.accion").value("BLOQUEADA"));
+                .andExpect(jsonPath("$.token").isNotEmpty())
+                .andExpect(jsonPath("$.tipo").value("Bearer"))
+                .andExpect(jsonPath("$.usuario_id").value((int) usuarioId))
+                .andReturn().getResponse().getContentAsString();
 
-        // 3. Consulta: demuestra que llego a PostgreSQL de verdad
+        // 3. Ese token, y solo ese, abre el historial
+        String cabecera = json.readTree(token).get("token").asText();
+        assertThat(cabecera.split("\\.")).as("JWT con tres partes").hasSize(3);
+
+        // 4. Transaccion sospechosa: IA + escritura en la BD real
+        mockMvc.perform(post("/api/v1/usuarios/" + usuarioId + "/transacciones")
+                        .header("Authorization", "Bearer " + cabecera)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"componentes":[-9.1698,7.0922,-12.354,4.2431,-7.1764,-3.3866,-8.058,6.4429,-2.413,-6.1349,2.8267,-6.3098,-0.623,-7.2799,0.9242,-4.2155,-7.1717,-2.5503,0.5964,0.8167,0.9262,-0.8177,-0.1504,-0.0394,0.4856,-0.2643,1.1597,0.2328],"monto":99.99,"hora":3,"pais":"NG","distancia_km":5200}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.accion").value("REQUIERE_REVISION"));
+
+        // 5. Consulta: demuestra que llego a PostgreSQL de verdad
         String historial = mockMvc.perform(
-                        org.springframework.test.web.servlet.request.MockMvcRequestBuilders
-                                .get("/api/v1/usuarios/" + usuarioId + "/transacciones"))
+                        get("/api/v1/usuarios/" + usuarioId + "/transacciones")
+                        .header("Authorization", "Bearer " + cabecera))
                 .andExpect(status().isOk())
                 .andReturn().getResponse().getContentAsString();
 
@@ -213,9 +252,10 @@ class IntegracionCompletaTest {
 
     @Order(8)
     @Test
-    @DisplayName("El pais desconocido NO se persiste como si fuera legitimo")
+    @DisplayName("El Pais no soportado NO se persiste como si fuera legitimo")
     void paisDesconocidoNoSePersisteComoLimpio() throws Exception {
-        String usuarioJson = mockMvc.perform(post("/api/v1/usuarios")
+        String usuarioJson = mockMvc.perform(
+                        post("/api/v1/sesiones/usuarios")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"email":"paisx@ejemplo.com","nombre":"Pais X",
@@ -224,18 +264,17 @@ class IntegracionCompletaTest {
         long usuarioId = json.readTree(usuarioJson).get("id").asLong();
 
         // La peticion falla (503) porque Python rechaza el pais.
-        mockMvc.perform(post("/api/v1/usuarios/" + usuarioId + "/transacciones")
-                        .contentType(MediaType.APPLICATION_JSON)
+        mockMvc.perform(postConToken("/api/v1/usuarios/" + usuarioId + "/transacciones", usuarioId)
                         .content("""
-                                {"monto":100,"hora":12,"pais":"JP","distancia_km":9000}"""))
+                                {"componentes":[1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234],"monto":100,"hora":12,"pais":"ZZ","distancia_km":9000}"""))
                 .andExpect(status().isServiceUnavailable());
 
         // Pero la transaccion se guarda, y lo que importa es COMO:
         // es_fraude NULL significa "nadie la evaluo". Si se guardara como
         // false, un fraude pasaria por aprobado.
         String historial = mockMvc.perform(
-                        org.springframework.test.web.servlet.request.MockMvcRequestBuilders
-                                .get("/api/v1/usuarios/" + usuarioId + "/transacciones"))
+                        getConToken("/api/v1/usuarios/" + usuarioId + "/transacciones",
+                                usuarioId))
                 .andReturn().getResponse().getContentAsString();
 
         JsonNode t = json.readTree(historial).get(0);
@@ -243,6 +282,115 @@ class IntegracionCompletaTest {
                 .as("es_fraude debe ser null, no false")
                 .isTrue();
         assertThat(t.get("estado").asText()).isEqualTo("NO_ANALIZADA");
+    }
+
+    // --------------------------------------- AISLAMIENTO ENTRE USUARIOS
+
+    @Order(9)
+    @Test
+    @DisplayName("Dos usuarios reales: el token de uno no abre el historial del otro")
+    void losTokensNoSeCruzan() throws Exception {
+        // El fallo que motivo todo el cambio de seguridad, comprobado de
+        // punta a punta: con la API key por cabecera, dos personas
+        // compartian credencial y cada una podia leer el historial de la
+        // otra. Aqui se crean dos usuarios de verdad en PostgreSQL, cada
+        // uno con su token, y se comprueba que no se cruzan.
+        long ana = crearUsuario("aisla-ana@ejemplo.com");
+        long bruno = crearUsuario("aisla-bruno@ejemplo.com");
+
+        // Ana analisa una transaccion.
+        mockMvc.perform(postConToken("/api/v1/usuarios/" + ana + "/transacciones", ana)
+                        .content("""
+                                {"componentes":[-0.2743,0.1401,2.227,-0.3606,-0.397,-0.6929,0.0618,-0.3533,-1.699,0.7048,0.0971,-0.5307,1.2179,-0.5407,1.5355,0.3505,0.7263,-1.3437,2.464,0.5843,-0.0503,-0.0985,-0.1118,0.3975,-0.0495,-0.2278,-0.0697,-0.1301],"monto":12.0,"hora":12,"pais":"ES","distancia_km":80}"""))
+                .andExpect(status().isOk());
+
+        // Ana ve una transaccion en su historial.
+        assertThat(json.readTree(mockMvc.perform(
+                        getConToken("/api/v1/usuarios/" + ana + "/transacciones", ana))
+                .andReturn().getResponse().getContentAsString()))
+                .as("Ana ve lo suyo")
+                .hasSize(1);
+
+        // Bruno ve los suyos, que estan vacios: no aparece la de Ana.
+        assertThat(json.readTree(mockMvc.perform(
+                        getConToken("/api/v1/usuarios/" + bruno + "/transacciones", bruno))
+                .andReturn().getResponse().getContentAsString()))
+                .as("Bruno no ve nada de Ana")
+                .isEmpty();
+
+        // Y el token de Bruno sobre el recurso de Ana es 404, no 403: un
+        // 403 confirmaria que el usuario existe.
+        mockMvc.perform(getConToken("/api/v1/usuarios/" + ana + "/transacciones", bruno))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.codigo").value("NO_ENCONTRADO"));
+
+        // Tampoco puede escribir en su nombre.
+        mockMvc.perform(postConToken("/api/v1/usuarios/" + ana + "/transacciones", bruno)
+                        .content("""
+                                {"componentes":[-0.2743,0.1401,2.227,-0.3606,-0.397,-0.6929,0.0618,-0.3533,-1.699,0.7048,0.0971,-0.5307,1.2179,-0.5407,1.5355,0.3505,0.7263,-1.3437,2.464,0.5843,-0.0503,-0.0985,-0.1118,0.3975,-0.0495,-0.2278,-0.0697,-0.1301],"monto":12.0,"hora":12,"pais":"ES","distancia_km":80}"""))
+                .andExpect(status().isNotFound());
+    }
+
+    @Order(10)
+    @Test
+    @DisplayName("Login: contrasena incorrecta 401, y el mismo mensaje que si no existiera")
+    void loginFallidoNoEnumeraCuentas() throws Exception {
+        crearUsuario("enumeracion@ejemplo.com");
+
+        String cuerpoMal = mockMvc.perform(post("/api/v1/sesiones/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"enumeracion@ejemplo.com","contrasena":"incorrecta"}"""))
+                .andExpect(status().isUnauthorized())
+                .andReturn().getResponse().getContentAsString();
+
+        String cuerpoAusente = mockMvc.perform(post("/api/v1/sesiones/login")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"nadie@ejemplo.com","contrasena":"lo-que-sea"}"""))
+                .andExpect(status().isUnauthorized())
+                .andReturn().getResponse().getContentAsString();
+
+        // Si los dos cuerpos fueran distintos, un atacante sabria que
+        // emails estan registrados. Y el tiempo tambien lo delata: por
+        // eso UsuarioService busca siempre y verifica con BCrypt, en vez
+        // de devolver antes si el email no existe.
+        assertThat(json.readTree(cuerpoMal).get("mensaje").asText())
+                .isEqualTo(json.readTree(cuerpoAusente).get("mensaje").asText());
+    }
+
+    @Order(11)
+    @Test
+    @DisplayName("Sin token, el historial devuelve 401 con cuerpo JSON")
+    void sinTokenDa401ConCuerpo() throws Exception {
+        long ana = crearUsuario("sin-token@ejemplo.com");
+
+        mockMvc.perform(get("/api/v1/usuarios/" + ana + "/transacciones"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.codigo").value("NO_AUTENTICADO"));
+    }
+
+    @Order(12)
+    @Test
+    @DisplayName("El health sigue abierto: sin token y sin base de datos usable")
+    void elHealthSigueAbierto() throws Exception {
+        // El health lo consultan Docker y el balanceador, y no tienen
+        // token de nadie. Cerrarlo dejaria el despliegue sin forma de
+        // saber si esta sano.
+        mockMvc.perform(get("/actuator/health"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("UP"));
+    }
+
+    private long crearUsuario(String email) throws Exception {
+        String cuerpo = mockMvc.perform(post("/api/v1/sesiones/usuarios")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"email":"%s","nombre":"Test",
+                                 "contrasena":"contrasena-larga-123"}""".formatted(email)))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        return json.readTree(cuerpo).get("id").asLong();
     }
 
     // ----------------------------------------- CONTRATO DE CAMPOS
@@ -258,26 +406,30 @@ class IntegracionCompletaTest {
         // Si alguien renombra "distancia_km" en Python, la peticion se
         // rechaza con 422, Java devuelve 503 y este test falla. Sin el,
         // el cambio pasaria los tests unitarios y llegaria a produccion.
-        mockMvc.perform(post("/api/transacciones")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        // Se manda el JSON con TODAS las claves correctas.
+        mockMvc.perform(postConToken("/api/transacciones", 1L)
                         .content("""
-                                {"monto":150,"hora":12,"pais":"ES","distancia_km":80}"""))
+                                {"componentes":[-0.2743,0.1401,2.227,-0.3606,-0.397,-0.6929,0.0618,-0.3533,-1.699,0.7048,0.0971,-0.5307,1.2179,-0.5407,1.5355,0.3505,0.7263,-1.3437,2.464,0.5843,-0.0503,-0.0985,-0.1118,0.3975,-0.0495,-0.2278,-0.0697,-0.1301],"monto":12.0,"hora":12,"pais":"ES","distancia_km":80}"""))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.probabilidad").exists())
                 .andExpect(jsonPath("$.modelo").exists())
                 .andExpect(jsonPath("$.nivel_riesgo").exists())
-                .andExpect(jsonPath("$.accion").exists());
+                .andExpect(jsonPath("$.accion").exists())
+                // El umbral viaje al cliente. Sin el, un cliente que ve
+                // probabilidad 0.5 no puede saber si la decision fue
+                // conservadora o agresiva.
+                .andExpect(jsonPath("$.umbral").exists())
+                // Y se declara que senas se usaron: el contrato incluye
+                // pais y distancia, pero el modelo no los mira.
+                .andExpect(jsonPath("$.senas_analizadas").value("componentes_PCA"));
     }
 
     @Order(4)
     @Test
     @DisplayName("La respuesta de Python trae todos los campos que Java deserializa")
     void contratoDeRespuesta() throws Exception {
-        String cuerpo = mockMvc.perform(post("/api/transacciones")
-                        .contentType(MediaType.APPLICATION_JSON)
+        String cuerpo = mockMvc.perform(postConToken("/api/transacciones", 1L)
                         .content("""
-                                {"monto":9000,"hora":3,"pais":"NG","distancia_km":5200}"""))
+                                {"componentes":[-9.1698,7.0922,-12.354,4.2431,-7.1764,-3.3866,-8.058,6.4429,-2.413,-6.1349,2.8267,-6.3098,-0.623,-7.2799,0.9242,-4.2155,-7.1717,-2.5503,0.5964,0.8167,0.9262,-0.8177,-0.1504,-0.0394,0.4856,-0.2643,1.1597,0.2328],"monto":99.99,"hora":3,"pais":"NG","distancia_km":5200}"""))
                 .andReturn().getResponse().getContentAsString();
 
         JsonNode nodo = json.readTree(cuerpo);

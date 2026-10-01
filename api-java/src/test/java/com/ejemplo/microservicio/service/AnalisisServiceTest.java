@@ -42,15 +42,23 @@ class AnalisisServiceTest {
     @InjectMocks
     private AnalisisService servicio;
 
+
+    /** 28 componentes PCA validos, como los espera el modelo. */
+    private static java.util.List<Double> componentes() {
+        return java.util.stream.IntStream.range(0, 28)
+                .mapToObj(i -> 1.234)
+                .toList();
+    }
+
     private static SolicitudTransaccion transaccion() {
-        return new SolicitudTransaccion(9500.0, 3, "NG", 5200.0);
+        return new SolicitudTransaccion(componentes(), 9500.0, 3, "NG", 5200.0);
     }
 
     @Test
     @DisplayName("Nivel critico bloquea la transaccion")
     void nivelCriticoBloquea() throws Exception {
         when(clienteIA.predecirFraude(any(PeticionFraudePython.class)))
-                .thenReturn(new RespuestaFraudePython(true, 0.95, "critico", "rf"));
+                .thenReturn(new RespuestaFraudePython(true, 0.95, "critico", "rf", 0.30));
 
         RespuestaFraude r = servicio.analizarTransaccion(transaccion());
 
@@ -62,7 +70,7 @@ class AnalisisServiceTest {
     @DisplayName("Nivel alto requiere revision humana")
     void nivelAltoRequiereRevision() throws Exception {
         when(clienteIA.predecirFraude(any(PeticionFraudePython.class)))
-                .thenReturn(new RespuestaFraudePython(true, 0.70, "alto", "rf"));
+                .thenReturn(new RespuestaFraudePython(true, 0.70, "alto", "rf", 0.30));
 
         assertEquals("REQUIERE_REVISION",
                 servicio.analizarTransaccion(transaccion()).accion());
@@ -72,7 +80,7 @@ class AnalisisServiceTest {
     @DisplayName("Nivel medio solo se monitoriza")
     void nivelMedioSeMonitoriza() throws Exception {
         when(clienteIA.predecirFraude(any(PeticionFraudePython.class)))
-                .thenReturn(new RespuestaFraudePython(true, 0.30, "medio", "rf"));
+                .thenReturn(new RespuestaFraudePython(true, 0.30, "medio", "rf", 0.30));
 
         assertEquals("MONITORIZAR",
                 servicio.analizarTransaccion(transaccion()).accion());
@@ -84,7 +92,7 @@ class AnalisisServiceTest {
         // Si Python anade un nivel nuevo o escribe mal uno, aprobar una
         // transaccion marcada como fraude es el error que no se deshace.
         when(clienteIA.predecirFraude(any(PeticionFraudePython.class)))
-                .thenReturn(new RespuestaFraudePython(true, 0.60, "desconocido", "rf"));
+                .thenReturn(new RespuestaFraudePython(true, 0.60, "desconocido", "rf", 0.30));
 
         assertEquals("REQUIERE_REVISION",
                 servicio.analizarTransaccion(transaccion()).accion());
@@ -94,7 +102,7 @@ class AnalisisServiceTest {
     @DisplayName("Sin fraude se aprueba")
     void sinFraudeSeAprueba() throws Exception {
         when(clienteIA.predecirFraude(any(PeticionFraudePython.class)))
-                .thenReturn(new RespuestaFraudePython(false, 0.02, "bajo", "rf"));
+                .thenReturn(new RespuestaFraudePython(false, 0.02, "bajo", "rf", 0.30));
 
         RespuestaFraude r = servicio.analizarTransaccion(transaccion());
 

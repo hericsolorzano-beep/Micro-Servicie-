@@ -70,6 +70,23 @@
         </dependency>
 
         <!--
+        Autenticacion por usuario con JWT.
+
+        La API key queHabia antes identifica a la APLICACION, no a la
+        persona: cualquier cliente que la tuviera podia leer el historial
+        de cualquier usuario. Eso no es autorizacion, es autenticacion de
+        cliente, y con datos de transacciones es insuficiente.
+
+        Con JWT, el token lleva el id del usuario en el subject. Cada
+        peticion se comprueba contra el recurso que toca, y si no
+        coinciden la respuesta es 404 sin revelar nada.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+        </dependency>
+
+        <!--
         Resiliencia: circuit breaker, reintentos y bulkhead para las
         llamadas al servicio de IA.
 

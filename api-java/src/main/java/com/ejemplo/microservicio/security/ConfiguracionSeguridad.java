@@ -1,49 +1,97 @@
 package com.ejemplo.microservicio.security;
 
+import com.ejemplo.microservicio.controller.SesionController;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
-import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.access.AccessDeniedHandler;
 
 /**
- * Cadena de seguridad de Spring.
+ * Cadena de seguridad basada en token de sesion por usuario.
  *
- * El unico proposito de esta clase es APAGAR el comportamiento por defecto
- * de Spring Security, no anadirle nada. Sin este bean, Spring Boot aplica
- * su configuracion automatica: proteccion CSRF, cabecera de sesion, y una
- * pagina de login HTML en todas las peticiones. Para una API sin
- * formularios ni cookies, todo eso es ruido.
+ * Publicas: el alta y el login, y el health. Todo lo demas exige un token
+ * valido. Y no basta con que sea valido: el id del token tiene que
+ * coincidir con el recurso solicitado, y eso lo comprueba
+ * ComprobadorDePropiedad, en el servicio.
  *
- * La autenticacion real la hace FiltroApiKey, que se registra como filtro
- * de servlet normal y por tanto se ejecuta ANTES de esta cadena.
- *
- * CSRF se desactiva porque esta API no usa cookies ni sesion: un cliente
- * que demuestra su identidad con una cabecera propia no puede ser victima
- * de CSRF, ya que el navegador no anade cabeceras custom por su cuenta.
+ * Esa segunda parte es la que faltaba antes. Con la API key por cabecera
+ * todos los clientes compartian credencial, asi que cualquiera que la
+ * tuviera podia leer el historial de cualquier usuario; se comprobo en
+ * ejecucion, con /usuarios/1/transacciones y /usuarios/2/transacciones
+ * devolviendo ambos 200 con la misma clave.
  */
 @Configuration
-// @WebMvcTest carga esta clase pero NO un SecurityFilterChain propio del
-// test, asi que se aplica el csrf().disable() global que declara Spring
-// Boot. En los tests de slice, Spring Security exige el token CSRF en los
-// POST aunque el csrf() este off en la configuracion de produccion.
-@EnableWebSecurity
 public class ConfiguracionSeguridad {
 
     @Bean
     public SecurityFilterChain cadena(HttpSecurity http) throws Exception {
 
-        http
-                .csrf(csrf -> csrf.disable())
+        // Con tokens no hay sesion ni cookies, asi que CSRF no aplica: un
+        // cliente que se autentica con una cabecera Authorization no puede
+        // ser victima de CSRF, porque el navegador no anade esa cabecera
+        // por su cuenta. Desactivarlo aqui no es un agujero: es la
+        // consecuencia de no usar cookies.
+        http.csrf(csrf -> csrf.disable())
                 .sessionManagement(s ->
                         s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
-                // Sin pagina de login: un 401 debe devolver JSON, no HTML,
-                // o el cliente no podria parsear la respuesta.
                 .httpBasic(basic -> basic.disable())
                 .formLogin(form -> form.disable())
-                .headers(headers -> headers.frameOptions(frame -> frame.deny()));
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers("/actuator/health", "/actuator/health/**")
+                        .permitAll()
+                        .requestMatchers(SesionController.RUTA_BASE + "/**")
+                        .permitAll()
+                        .anyRequest().authenticated())
+                .oauth2ResourceServer(oauth -> oauth
+                        .jwt(jwt -> { })
+                        .authenticationEntryPoint(entradaJson())
+                        .accessDeniedHandler(denegadoJson()));
 
         return http.build();
+    }
+
+    /**
+     * 401 en JSON, no con cuerpo vacio.
+     *
+     * Spring devuelve por defecto un 401 sin cuerpo. Un cliente que
+     * espera JSON recibe algo que no puede parsear y no distingue el
+     * fallo de autenticacion de un corte de red. Ademas sin cuerpo no
+     * hay forma de saber si el token falto, vencio o tenia la firma
+     * mal, que son tres causas de trabajo muy distintas.
+     */
+    private org.springframework.security.web.AuthenticationEntryPoint entradaJson() {
+        return (request, response, ex) -> {
+            response.setStatus(HttpStatus.UNAUTHORIZED.value());
+            response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+            response.setCharacterEncoding("UTF-8");
+            response.getWriter().write(
+                    "{\"codigo\":\"NO_AUTENTICADO\","
+                    + "\"mensaje\":\"Falta un token de sesion valido o ha caducado\","
+                    + "\"detalles\":{}}");
+        };
+    }
+
+    /**
+     * 403 en JSON.
+     *
+     * Cuando aparece un 403 es que hay token valido pero sin permiso
+     * sobre el recurso. El caso normal (pedir el historial de otro) no
+     * llega aqui: ComprobadorDePropiedad lo convierte en 404 para no
+     * confirmar que el usuario existe.
+     */
+    private AccessDeniedHandler denegadoJson() {
+        return (request, response, ex) -> {
+            response.setStatus(HttpStatus.FORBIDDEN.value());
+            response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+            response.setCharacterEncoding("UTF-8");
+            response.getWriter().write(
+                    "{\"codigo\":\"ACCESO_DENEGADO\","
+                    + "\"mensaje\":\"No tienes permiso para este recurso\","
+                    + "\"detalles\":{}}");
+        };
     }
 }

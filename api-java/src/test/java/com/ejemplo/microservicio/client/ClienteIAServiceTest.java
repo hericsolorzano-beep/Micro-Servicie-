@@ -26,6 +26,13 @@ import org.springframework.web.client.RestClient;
  */
 class ClienteIAServiceTest {
 
+    /** 28 componentes PCA validos, como los espera el modelo. */
+    private static java.util.List<Double> componentes() {
+        return java.util.stream.IntStream.range(0, 28)
+                .mapToObj(i -> 1.234)
+                .toList();
+    }
+
     // bindTo espera el Builder, no el RestClient ya construido: es el
     // builder el que puede sustituir la capa de transporte por el mock.
     private final RestClient.Builder builder = RestClient.builder()
@@ -46,6 +53,7 @@ class ClienteIAServiceTest {
                     // distancia_km, NO distanciaKm: si esto cambia, Python
                     // recibe null y responde 422.
                     assertThat(cuerpo).contains("\"distancia_km\"");
+                    assertThat(cuerpo).contains("\"componentes\"");
                     assertThat(cuerpo).doesNotContain("distanciaKm");
                     assertThat(cuerpo).contains("\"monto\"").contains("\"hora\"")
                             .contains("\"pais\"");
@@ -56,7 +64,7 @@ class ClienteIAServiceTest {
                         MediaType.APPLICATION_JSON));
 
         assertThat(cliente.predecirFraude(
-                new PeticionFraudePython(9000.0, 3, "NG", 5200.0)).esFraude())
+                new PeticionFraudePython(componentes(), 9000.0, 3, "NG", 5200.0)).esFraude())
                 .isTrue();
 
         servidor.verify();
@@ -74,7 +82,7 @@ class ClienteIAServiceTest {
                         + "\"nuevo_campo\":\"ignorado\"}",
                         MediaType.APPLICATION_JSON));
 
-        var r = cliente.predecirFraude(new PeticionFraudePython(150.0, 12, "ES", 80.0));
+        var r = cliente.predecirFraude(new PeticionFraudePython(componentes(), 150.0, 12, "ES", 80.0));
 
         assertThat(r.esFraude()).isFalse();
         assertThat(r.nivelRiesgo()).isEqualTo("bajo");
@@ -89,7 +97,7 @@ class ClienteIAServiceTest {
         // Sin esta comprobacion, el null llegaria a AnalisisService y
         // explotaria con un NullPointerException -> 500 opaco.
         assertThatThrownBy(() ->
-                cliente.predecirFraude(new PeticionFraudePython(150.0, 12, "ES", 80.0)))
+                cliente.predecirFraude(new PeticionFraudePython(componentes(), 150.0, 12, "ES", 80.0)))
                 .isInstanceOf(ServicioIANoDisponibleException.class)
                 .hasMessageContaining("incompleta");
     }
@@ -106,7 +114,7 @@ class ClienteIAServiceTest {
                         MediaType.APPLICATION_JSON));
 
         assertThatThrownBy(() ->
-                cliente.predecirFraude(new PeticionFraudePython(9000.0, 3, "NG", 5200.0)))
+                cliente.predecirFraude(new PeticionFraudePython(componentes(), 9000.0, 3, "NG", 5200.0)))
                 .isInstanceOf(ServicioIANoDisponibleException.class)
                 .hasMessageContaining("incompleta");
     }

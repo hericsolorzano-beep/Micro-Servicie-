@@ -24,9 +24,12 @@ spring:
     enabled: true
     locations: classpath:db/migration
 
-seguridad:
-  activada: false
-  clave: ""
+# Clave fija para los tests: el token se emite con ella y se verifica con
+# ella, asi que da igual que sea publica. Fijarla evita el aviso de
+# "clave generada al arrancar" en cada ejecucion y hace los tokens
+# reproducibles.
+jwt:
+  secret: clave-de-prueba-para-los-tests-de-integracion
 
 ia:
   base-url: http://localhost:9999

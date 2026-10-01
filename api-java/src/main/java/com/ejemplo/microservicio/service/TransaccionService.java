@@ -5,10 +5,13 @@ import com.ejemplo.microservicio.dto.PeticionFraudePython;
 import com.ejemplo.microservicio.dto.RespuestaFraude;
 import com.ejemplo.microservicio.dto.RespuestaFraudePython;
 import com.ejemplo.microservicio.dto.SolicitudTransaccion;
+import com.ejemplo.microservicio.exception.UsuarioNoEncontradoException;
 import com.ejemplo.microservicio.exception.ServicioIANoDisponibleException;
 import com.ejemplo.microservicio.repository.TransaccionRepository;
 import com.ejemplo.microservicio.domain.Usuario;
 import com.ejemplo.microservicio.repository.UsuarioRepository;
+import com.ejemplo.microservicio.repository.ComponenteRepository;
+import com.ejemplo.microservicio.domain.Componente;
 import java.math.BigDecimal;
 import java.util.List;
 import org.slf4j.Logger;
@@ -38,16 +41,22 @@ public class TransaccionService {
 
     private static final Logger log = LoggerFactory.getLogger(TransaccionService.class);
 
+    /** Nº de componentes PCA que espera el modelo. */
+    static final int NUM_COMPONENTES = 28;
+
     private final ClienteIAResiliente clienteIA;
     private final TransaccionRepository repositorio;
     private final UsuarioRepository usuarios;
+    private final ComponenteRepository componentes;
 
     public TransaccionService(ClienteIAResiliente clienteIA,
                               TransaccionRepository repositorio,
-                              UsuarioRepository usuarios) {
+                              UsuarioRepository usuarios,
+                              ComponenteRepository componentes) {
         this.clienteIA = clienteIA;
         this.repositorio = repositorio;
         this.usuarios = usuarios;
+        this.componentes = componentes;
     }
 
     /**
@@ -72,10 +81,12 @@ public class TransaccionService {
                 BigDecimal.valueOf(solicitud.monto()),
                 solicitud.hora(),
                 solicitud.pais(),
-                BigDecimal.valueOf(solicitud.distanciaKm()));
+                BigDecimal.valueOf(solicitud.distanciaKm()),
+                solicitud.componentes().size());
 
         try {
             PeticionFraudePython peticion = new PeticionFraudePython(
+                    solicitud.componentes(),
                     solicitud.monto(),
                     solicitud.hora(),
                     solicitud.pais(),
@@ -95,27 +106,22 @@ public class TransaccionService {
                     respuesta.nivelRiesgo(),
                     respuesta.modelo(),
                     accion,
-                    ms);
+                    ms,
+                    respuesta.umbral());
 
-            guardar(transaccion);
+            guardar(transaccion, solicitud.componentes());
 
             log.info("Transaccion pais={} -> {} accion={} (guardada)",
                     solicitud.pais(), respuesta.esFraude(), accion);
 
-            return new RespuestaFraude(
-                    respuesta.esFraude(),
-                    respuesta.probabilidad(),
-                    respuesta.nivelRiesgo(),
-                    respuesta.modelo(),
-                    accion,
-                    ms);
+            return RespuestaFraude.de(respuesta, accion, ms);
 
         } catch (ServicioIANoDisponibleException e) {
             // Saved WITHOUT a verdict, and the 503 is propagated. Both
             // are needed: the client knows there is no verdict, and the
             // auditor knows the operation existed.
             transaccion.registrarErrorAnalisis(e.getMessage());
-            guardar(transaccion);
+            guardar(transaccion, solicitud.componentes());
 
             log.warn("Transaccion registrada sin analizar: {}", e.getMessage());
 
@@ -131,8 +137,10 @@ public class TransaccionService {
      * down with it, which is exactly what must be avoided here.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public Transaccion guardar(Transaccion transaccion) {
-        return repositorio.save(transaccion);
+    public Transaccion guardar(Transaccion transaccion, List<Double> componentesPca) {
+        Transaccion guardada = repositorio.save(transaccion);
+        Componente.guardarTodas(componentes, guardada, componentesPca);
+        return guardada;
     }
 
     /**

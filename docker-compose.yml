@@ -109,19 +109,18 @@ services:
       DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:?define POSTGRES_DB}
       DB_USER: ${DB_USER:?define DB_USER en .env}
       DB_PASSWORD: ${DB_PASSWORD:?define DB_PASSWORD en .env}
-      # La seguridad viene DESACTIVADA por defecto, porque la clave no
-      # puede estar en un archivo versionado. Para activarla hay que
-      # exportarla ANTES de docker compose up:
-      #   SEGURIDAD_CLAVE=$(openssl rand -hex 32) docker compose up -d
-      # Si la clave queda vacia pero se activa, la API no acepta NINGUNA
-      # clave: falla cerrado, no abierto.
+      # Secreto con el que se firman los tokens de sesion.
       #
-      # Estas lineas usan ${...} para que el valor llegue al contenedor.
-      # Declararlas sin ${} hacia que la variable del shell se ignorase y
-      # la API quedara abierta sin avisar: el sintoma es que todo responde
-      # 200, y no da ningun error.
-      SEGURIDAD_ACTIVADA: ${SEGURIDAD_ACTIVADA:-false}
-      SEGURIDAD_CLAVE: ${SEGURIDAD_CLAVE:-}
+      # Se declara con ${JWT_SECRET:?...} y no con un valor por defecto:
+      # si falta, compose NO arranca y dice cual es la variable que falta.
+      # La alternativa (dejarlo vacio y avisar por el log) significa una
+      # API que responde 200 a todo el mundo con una clave distinta en
+      # cada arranque: nadie se entera y las sesiones mueren solas.
+      #
+      # La linea usa ${...} a proposito. Declararla sin ${} haria que la
+      # variable del shell se ignorase y el contenedor receberia una
+      # cadena vacia, sin ningun error visible.
+      JWT_SECRET: ${JWT_SECRET:?define JWT_SECRET en .env (openssl rand -hex 32)}
       # "never" en el despliegue normal. Para depurar:
       #   HEALTH_SHOW_DETAILS=always docker compose up -d
       # Igual que las de seguridad, necesita ${...} para que la variable

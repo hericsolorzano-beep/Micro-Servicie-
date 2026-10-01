@@ -53,6 +53,12 @@ public record RespuestaTransaccion(
         @JsonProperty("accion")
         String accion,
 
+        @JsonProperty("umbral")
+        Double umbral,
+
+        @JsonProperty("numero_componentes")
+        Integer numeroComponentes,
+
         @JsonProperty("error_analisis")
         String errorAnalisis,
 
@@ -95,6 +101,8 @@ public record RespuestaTransaccion(
                 t.getNivelRiesgo(),
                 t.getModelo(),
                 t.getAccion(),
+                t.getUmbral(),
+                t.getNumeroComponentes(),
                 t.getErrorAnalisis(),
                 estado,
                 t.getTiempoInferenciaMs(),

@@ -1,16 +1,17 @@
 package com.ejemplo.microservicio.controller;
 
 import com.ejemplo.microservicio.domain.Usuario;
+import com.ejemplo.microservicio.dto.RespuestaFraude;
 import com.ejemplo.microservicio.dto.RespuestaTransaccion;
 import com.ejemplo.microservicio.dto.RespuestaUsuario;
-import com.ejemplo.microservicio.dto.SolicitudRegistro;
 import com.ejemplo.microservicio.dto.SolicitudTransaccion;
+import com.ejemplo.microservicio.exception.AccesoDenegadoException;
 import com.ejemplo.microservicio.exception.ServicioIANoDisponibleException;
+import com.ejemplo.microservicio.exception.UsuarioNoEncontradoException;
+import com.ejemplo.microservicio.security.ComprobadorDePropiedad;
 import com.ejemplo.microservicio.service.TransaccionService;
-import com.ejemplo.microservicio.service.UsuarioNoEncontradoException;
 import com.ejemplo.microservicio.service.UsuarioService;
 import jakarta.validation.Valid;
-import java.net.URI;
 import java.util.List;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.ResponseEntity;
@@ -34,36 +35,24 @@ public class UsuarioController {
 
     private final UsuarioService usuarios;
     private final TransaccionService transacciones;
+    private final ComprobadorDePropiedad propiedad;
 
     public UsuarioController(UsuarioService usuarios,
-                             TransaccionService transacciones) {
+                             TransaccionService transacciones,
+                             ComprobadorDePropiedad propiedad) {
         this.usuarios = usuarios;
         this.transacciones = transacciones;
+        this.propiedad = propiedad;
     }
 
-    /**
-     * Alta de usuario. 201 + cabecera Location.
-     */
-    @PostMapping("/usuarios")
-    public ResponseEntity<RespuestaUsuario> registrar(
-            @Valid @RequestBody SolicitudRegistro solicitud) {
-
-        Usuario creado = usuarios.crear(
-                solicitud.email(), solicitud.nombre(), solicitud.contrasena());
-
-        return ResponseEntity
-                .created(URI.create("/api/v1/usuarios/" + creado.getId()))
-                .body(RespuestaUsuario.desde(creado));
-    }
-
-    /**
-     * Perfil del usuario.
-     *
-     * Devuelve 404 si no existe, no null con 200: un JSON null obliga al
-     * cliente a adivinar si fallo o si no hay contenido.
-     */
     @GetMapping("/usuarios/{id}")
     public ResponseEntity<RespuestaUsuario> perfil(@PathVariable Long id) {
+
+        // Se comprueba la propiedad ANTES de tocar la base de datos: si el
+        // token no es de este usuario, la respuesta es 404 sin revelar si
+        // el usuario existe.
+        propiedad.exigir(id);
+
         Usuario usuario = usuarios.buscarPorId(id);
         if (usuario == null) {
             throw new UsuarioNoEncontradoException(id);
@@ -73,27 +62,39 @@ public class UsuarioController {
 
     /**
      * Analiza una transaccion y la guarda.
-     *
-     * Mismo comportamiento que /api/transacciones mas la persistencia.
-     * Se mantiene el endpoint antiguo sin usuario para no romper el
-     * contrato existente.
      */
     @PostMapping("/usuarios/{id}/transacciones")
-    public ResponseEntity<?> analizar(
+    public ResponseEntity<RespuestaFraude> analizar(
             @PathVariable Long id,
             @Valid @RequestBody SolicitudTransaccion solicitud)
             throws ServicioIANoDisponibleException {
 
-        var respuesta = transacciones.analizarYGuardar(id, solicitud);
+        // Propiedad primero: un token ajeno no debe poder gastar una
+        // inferencia, ni aunque el usuario exista.
+        propiedad.exigir(id);
+
+        // Luego existencia: si no existe, gastaria una inferencia y un
+        // hueco en el modelo de riesgo para nada.
+        if (usuarios.buscarPorId(id) == null) {
+            throw new UsuarioNoEncontradoException(id);
+        }
+
+        RespuestaFraude respuesta = transacciones.analizarYGuardar(id, solicitud);
         return ResponseEntity.ok(respuesta);
     }
 
     /**
-     * Historial del usuario.
+     * Historial del usuario, paginado.
      *
-     * El limite de pagina NO es opcional: sin el, "dame todo" carga toda
-     * la tabla en memoria. El maximo de 100 impide que un solo cliente
+     * El limite NO es opcional: sin el, "dame todo" carga la tabla
+     * entera en memoria. El maximo de 100 impide que un solo cliente
      * pida la tabla entera.
+     *
+     * Las transacciones de un usuario solo se ven en las rutas que
+     * llevan SU id (/usuarios/{id}/transacciones). No hay endpoint
+     * global, y esa es la decision de seguridad que mas importa aqui:
+     * sin un parametro de propietario, cualquier cliente autenticado
+     * podria listar la transaccion de cualquiera.
      */
     @GetMapping("/usuarios/{id}/transacciones")
     public ResponseEntity<List<RespuestaTransaccion>> historial(
@@ -101,6 +102,16 @@ public class UsuarioController {
             @RequestParam(defaultValue = "0") int pagina,
             @RequestParam(defaultValue = "20") int tamano,
             @RequestParam(defaultValue = "false") boolean soloFraude) {
+
+        // 404 y no 403: un 403 confirmaria que el usuario existe, y
+        // permitiria enumerarlos probando identificadores. propiedad.exigir
+        // ya lanza AccesoDenegadoException.comoSiNoExistiera() cuando el
+        // token es de otro usuario.
+        propiedad.exigir(id);
+
+        if (usuarios.buscarPorId(id) == null) {
+            throw AccesoDenegadoException.comoSiNoExistiera();
+        }
 
         int tamanoSeguro = Math.min(Math.max(tamano, 1), 100);
         var page = PageRequest.of(Math.max(pagina, 0), tamanoSeguro);

@@ -1,26 +1,29 @@
 package com.ejemplo.microservicio.dto;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+import java.util.List;
 
 /**
  * Contrato PRIVADO hacia el servicio de IA.
  *
- * Separate del DTO publico a proposito. Si el dia de manana Python exige un
- * campo "dispositivo_id", este record cambia y el contrato publico no se
- * entera. Esa es toda la gracia de la frontera.
+ * Separate del DTO publico a proposito. Si manana el servicio de IA pide
+ * otro formato, este record cambia y el contrato publico no se entera.
  */
 public record PeticionFraudePython(
 
-    @JsonProperty("monto")
-    Double monto,
+        @JsonProperty("componentes")
+        List<Double> componentes,
 
-    @JsonProperty("hora")
-    Integer hora,
+        @JsonProperty("monto")
+        Double monto,
 
-    @JsonProperty("pais")
-    String pais,
+        @JsonProperty("hora")
+        Integer hora,
 
-    @JsonProperty("distancia_km")
-    Double distanciaKm
+        @JsonProperty("pais")
+        String pais,
+
+        @JsonProperty("distancia_km")
+        Double distanciaKm
 ) {
 }

@@ -35,11 +35,28 @@ public class ManejadorErrores extends ResponseEntityExceptionHandler {
     private static final Logger log = LoggerFactory.getLogger(ManejadorErrores.class);
 
 /**
+ * Acceso denegado a un recurso.
+ *
+ * Devuelve 404 y no 403 a proposito: un 403 confirma que el recurso
+ * EXISTE pero que no es tuyo, y eso permite enumerar usuarios validos
+ * probando identificadores. El 404 no revela nada.
+ *
+ * Ver AccesoDenegadoException.comoSiNoExistiera().
+ */
+@ExceptionHandler(com.ejemplo.microservicio.exception.AccesoDenegadoException.class)
+public ResponseEntity<RespuestaError> accesoDenegado(
+        com.ejemplo.microservicio.exception.AccesoDenegadoException e) {
+
+    return ResponseEntity.status(HttpStatus.NOT_FOUND).body(
+            RespuestaError.de("NO_ENCONTRADO", e.getMessage()));
+}
+
+/**
  * El usuario indicado no existe: 404, no 400 ni 500.
  */
-@ExceptionHandler(com.ejemplo.microservicio.service.UsuarioNoEncontradoException.class)
+@ExceptionHandler(com.ejemplo.microservicio.exception.UsuarioNoEncontradoException.class)
 public ResponseEntity<RespuestaError> usuarioNoEncontrado(
-        com.ejemplo.microservicio.service.UsuarioNoEncontradoException e) {
+        com.ejemplo.microservicio.exception.UsuarioNoEncontradoException e) {
 
     return ResponseEntity.status(HttpStatus.NOT_FOUND).body(
             RespuestaError.de("USUARIO_NO_ENCONTRADO", e.getMessage()));
