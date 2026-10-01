@@ -139,7 +139,7 @@ class IntegracionCompletaTest {
 
     @Order(7)
     @Test
-    @DisplayName("Fraude: pais desconocido devuelve 503, no una prediccion inventada")
+    @DisplayName("Fraude: pais desconocido devuelve 400 y NO envenena el circuito")
     void paisDesconocido() throws Exception {
         // El encoder de Python usa handle_unknown='ignore'. Sin el
         // rechazo explicito de PAISES_CONOCIDOS, JP pasaria al vector de
@@ -148,8 +148,60 @@ class IntegracionCompletaTest {
         mockMvc.perform(postConToken("/api/transacciones", 1L)
                         .content("""
                                 {"componentes":[1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234],"monto":100,"hora":12,"pais":"ZZ","distancia_km":9000}"""))
-                .andExpect(status().isServiceUnavailable())
-                .andExpect(jsonPath("$.codigo").value("IA_NO_DISPONIBLE"));
+                // 400 y no 503. La peticion es invalida, no nuestra
+                // dependencia: un 503 hacia que el cliente reintentara
+                // algo que jamas va a funcionar.
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.codigo").value("PETICION_INVALIDA"));
+    }
+
+    @Order(13)
+    @Test
+    @DisplayName("Un pais no soportado NO puede dejar el detector de fraude caido")
+    void paisNoSoportadoNoEnvenenaElCircuito() throws Exception {
+        // El fallo mas caro que encontro la revision, yendo mas alla de la
+        // teoria. Un 422 de Python (pais no soportado) se traducía a
+        // "IA no disponible", que era el unico tipo de retry-exceptions y
+        // ademas contaba como fallo del circuito. Medido antes del arreglo,
+        // contra este mismo stack:
+        //
+        //   ES -> 200 APROBADA
+        //   AA,AB,AC,AD,AE -> 503 IA_NO_DISPONIBLE
+        //   AG -> 503 CIRCUITO_ABIERTO
+        //   ES -> 503 CIRCUITO_ABIERTO   <-- la peticion legitima cae
+        //
+        // O sea: un campo de texto libre permitia apagar la deteccion de
+        // fraude para todos durante 30 s, sin necesitar credenciales
+        // especiales. En pagos, es el fallo que mas caro sale.
+        //
+        // Aqui se ejerce el ataque y luego se comprueba que el
+        // servicio legitimo sigue respondiendo.
+        String cuerpo = """
+                {"componentes":[-0.2743,0.1401,2.227,-0.3606,-0.397,-0.6929,0.0618,-0.3533,-1.699,0.7048,0.0971,-0.5307,1.2179,-0.5407,1.5355,0.3505,0.7263,-1.3437,2.464,0.5843,-0.0503,-0.0985,-0.1118,0.3975,-0.0495,-0.2278,-0.0697,-0.1301],"monto":12.0,"hora":12,"pais":"%s","distancia_km":80}""";
+
+        // Formatos validos, paises que el modelo no conoce. Es lo que
+        // hace un atacante: no hace falta nada raro, solo saber que hay
+        // una lista.
+        String[] paises = {"AA","AB","AC","AD","AE","AF","AG","AH","AI","AJ"};
+
+        for (String pais : paises) {
+            mockMvc.perform(postConToken("/api/transacciones", 1L)
+                            .content(cuerpo.formatted(pais)))
+                    .andExpect(status().isBadRequest());
+        }
+
+        // Si alguno hubiera envenenado el circuito, esto daria
+        // CIRCUITO_ABIERTO. El @BeforeEach resetea el circuito entre
+        // tests, asi que este fallo seria de este test y no heredado.
+        mockMvc.perform(postConToken("/api/transacciones", 1L)
+                        .content(cuerpo.formatted("ES")))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.accion").value("APROBADA"));
+
+        assertThat(breakerRegistry.circuitBreaker("servicioIA").getState())
+                .as("diez rechazos por contenido no abren el circuito")
+                .isEqualTo(io.github.resilience4j.circuitbreaker
+                        .CircuitBreaker.State.CLOSED);
     }
 
     // -------------------------------------------------- SENTIMIENTO
@@ -252,36 +304,55 @@ class IntegracionCompletaTest {
 
     @Order(8)
     @Test
-    @DisplayName("El Pais no soportado NO se persiste como si fuera legitimo")
-    void paisDesconocidoNoSePersisteComoLimpio() throws Exception {
-        String usuarioJson = mockMvc.perform(
-                        post("/api/v1/sesiones/usuarios")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("""
-                                {"email":"paisx@ejemplo.com","nombre":"Pais X",
-                                 "contrasena":"contrasena-larga-123"}"""))
-                .andReturn().getResponse().getContentAsString();
-        long usuarioId = json.readTree(usuarioJson).get("id").asLong();
+    @DisplayName("Una peticion rechazada por Python NO se persiste como si fuera limpia")
+    void peticionRechazadaNoSePersisteComoLimpio() throws Exception {
+        // El caso central del modulo de persistencia: una peticion que
+        // acaba sin veredicto NO debe quedar guardada como "limpia".
+        //
+        // El camino de un pais no soportado es el que queda: Java valida
+        // formato (^[A-Z]{2}$), asi que "ZZ" pasa, y es Python quien lo
+        // rechaza con 422 porque no esta en la lista de paises que el
+        // modelo conoce. Java lo traduce a PeticionRechazadaPorIAException
+        // y responde 400.
+        //
+        // Lo que NO puede pasar es que eso acabe en el historico como
+        // es_fraude=false. FALSE significa "evaluada y limpia"; si una
+        // peticion sin evaluar se guardara asi, pasaria por aprobada en
+        // cuanto la IA tuviera un mal dia.
+        long usuarioId = crearUsuario("rechazada@ejemplo.com");
 
-        // La peticion falla (503) porque Python rechaza el pais.
-        mockMvc.perform(postConToken("/api/v1/usuarios/" + usuarioId + "/transacciones", usuarioId)
-                        .content("""
-                                {"componentes":[1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234,1.234],"monto":100,"hora":12,"pais":"ZZ","distancia_km":9000}"""))
-                .andExpect(status().isServiceUnavailable());
+        String cuerpo = """
+                {"componentes":[-0.2743,0.1401,2.227,-0.3606,-0.397,-0.6929,0.0618,-0.3533,-1.699,0.7048,0.0971,-0.5307,1.2179,-0.5407,1.5355,0.3505,0.7263,-1.3437,2.464,0.5843,-0.0503,-0.0985,-0.1118,0.3975,-0.0495,-0.2278,-0.0697,-0.1301],"monto":100.0,"hora":12,"pais":"ZZ","distancia_km":80}""";
 
-        // Pero la transaccion se guarda, y lo que importa es COMO:
-        // es_fraude NULL significa "nadie la evaluo". Si se guardara como
-        // false, un fraude pasaria por aprobado.
+        mockMvc.perform(postConToken(
+                        "/api/v1/usuarios/" + usuarioId + "/transacciones", usuarioId)
+                        .content(cuerpo))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.codigo").value("PETICION_INVALIDA"));
+
+        // Se guarda el INTENTO, con es_fraude en NULL y estado
+        // NO_ANALIZADA. Descartarlo seria peor: se perderia el registro
+        // de todo lo que se intento y no se pudo evaluar, que es
+        // justamente lo que despues hay que revisar a mano.
         String historial = mockMvc.perform(
                         getConToken("/api/v1/usuarios/" + usuarioId + "/transacciones",
                                 usuarioId))
                 .andReturn().getResponse().getContentAsString();
 
-        JsonNode t = json.readTree(historial).get(0);
+        JsonNode transacciones = json.readTree(historial);
+        assertThat(transacciones)
+                .as("el intento fallido se conserva para auditoria")
+                .hasSize(1);
+
+        JsonNode t = transacciones.get(0);
         assertThat(t.get("es_fraude").isNull())
-                .as("es_fraude debe ser null, no false")
+                .as("es_fraude debe ser null, NUNCA false: false significa "
+                    + "\"evaluada y limpia\"")
                 .isTrue();
         assertThat(t.get("estado").asText()).isEqualTo("NO_ANALIZADA");
+        assertThat(t.get("accion").isNull())
+                .as("sin veredicto no puede haber accion de negocio")
+                .isTrue();
     }
 
     // --------------------------------------- AISLAMIENTO ENTRE USUARIOS

@@ -4,9 +4,11 @@ import com.ejemplo.microservicio.dto.PeticionFraudePython;
 import com.ejemplo.microservicio.dto.PeticionTextoPython;
 import com.ejemplo.microservicio.dto.RespuestaFraudePython;
 import com.ejemplo.microservicio.dto.RespuestaSentimientoPython;
+import com.ejemplo.microservicio.exception.PeticionRechazadaPorIAException;
 import com.ejemplo.microservicio.exception.ServicioIANoDisponibleException;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestClientException;
 
 /**
@@ -50,12 +52,31 @@ public class ClienteIAService {
             }
             return r;
 
+        } catch (HttpClientErrorException e) {
+            // Un 4xx de Python (normalmente 422 por un pais no soportado o
+            // un numero de componentes incorrecto) NO es una caida de la
+            // dependencia: es la peticion del cliente la que no vale.
+            //
+            // Confundir los dos casos era un agujero real: este error es el
+            // unico tipo de retry-exceptions, asi que se reintentaba, y al
+            // final se contaba como fallo del circuito. Unas diez
+            // peticiones con un pais no soportado (un campo de texto
+            // libre, validado solo por formato) abrian el circuito y dejaban
+            // el detector de fraude caido para TODOS durante 30 s.
+            // Medido contra el stack en ejecucion.
+            //
+            // Se traduce a una excepcion que no reintenta y no cuenta como
+            // fallo. Ver PeticionRechazadaPorIAException.
+            throw new PeticionRechazadaPorIAException(
+                    e.getStatusCode().value(),
+                    "El servicio de IA rechazo la peticion: " + e.getStatusCode(),
+                    e);
+
         } catch (RestClientException e) {
             // RestClientException cubre timeouts, errores de conexion y
-            // tambien respuestas 4xx/5xx de Python. Distinguirlos exigiria
-            // catches separados; aqui solo hace falta distinguir entre
-            // "pude obtener respuesta" y "no pude", que es lo que el
-            // servicio de negocio necesita para decidir el fallback.
+            // respuestas 5xx de Python. Todo eso SI es indisponibilidad de
+            // la dependencia, y por eso el servicio de negocio puede
+            // decidir el fallback.
             throw new ServicioIANoDisponibleException(
                     "El servicio de IA no respondio correctamente", e);
         }
@@ -81,6 +102,15 @@ public class ClienteIAService {
                         "El servicio de IA devolvio una respuesta incompleta");
             }
             return r;
+
+        } catch (HttpClientErrorException e) {
+            // Mismo motivo que en predecirFraude: un 4xx es un error de la
+            // peticion del cliente, no la caida de la dependencia, y no
+            // debe abrir el circuito.
+            throw new PeticionRechazadaPorIAException(
+                    e.getStatusCode().value(),
+                    "El servicio de IA rechazo la peticion: " + e.getStatusCode(),
+                    e);
 
         } catch (RestClientException e) {
             throw new ServicioIANoDisponibleException(

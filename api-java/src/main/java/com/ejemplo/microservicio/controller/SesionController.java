@@ -31,6 +31,9 @@ public class SesionController {
     /** Ruta de login. Publica por definicion: es la puerta de entrada. */
     public static final String RUTA_LOGIN = RUTA_BASE + "/login";
 
+    /** Alta de usuario. Publica: todavia no hay token con el que entrar. */
+    public static final String RUTA_ALTA = RUTA_BASE + "/usuarios";
+
     private static final Logger log = LoggerFactory.getLogger(SesionController.class);
 
     private final UsuarioService usuarios;
@@ -48,7 +51,7 @@ public class SesionController {
      * desde una IP de confianza, o con un codigo de invitacion), porque
      * permitir el autoservicio abierto es una via de registro masivo.
      */
-    @PostMapping("/usuarios")
+    @PostMapping("/usuarios")  // == RUTA_ALTA
     public ResponseEntity<RespuestaUsuario> registrar(
             @Valid @RequestBody SolicitudRegistro solicitud) {
 

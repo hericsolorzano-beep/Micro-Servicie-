@@ -43,8 +43,14 @@ public class ConfiguracionSeguridad {
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/actuator/health", "/actuator/health/**")
                         .permitAll()
-                        .requestMatchers(SesionController.RUTA_BASE + "/**")
-                        .permitAll()
+                        // Las publicas se nombran una a una, no con un
+                        // comodin sobre /sesiones/**. Con el comodin, un
+                        // endpoint futuro bajo ese prefijo (por ejemplo
+                        // /sesiones/{id}/revocar) quedaria publico sin que
+                        // nadie se entere al anadirlo, y no habria ningun
+                        // test que lo detectara.
+                        .requestMatchers(SesionController.RUTA_LOGIN).permitAll()
+                        .requestMatchers(SesionController.RUTA_ALTA).permitAll()
                         .anyRequest().authenticated())
                 .oauth2ResourceServer(oauth -> oauth
                         .jwt(jwt -> { })

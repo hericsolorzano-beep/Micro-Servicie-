@@ -1,6 +1,8 @@
 package com.ejemplo.microservicio.security;
 
 import com.ejemplo.microservicio.exception.AccesoDenegadoException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.oauth2.jwt.Jwt;
@@ -27,6 +29,9 @@ import org.springframework.stereotype.Component;
 @Component
 public class ComprobadorDePropiedad {
 
+    private static final Logger log =
+            LoggerFactory.getLogger(ComprobadorDePropiedad.class);
+
     /**
      * @param recursoId id del recurso solicitado en la ruta
      * @throws AccesoDenegadoException si el token es de otro usuario
@@ -37,9 +42,18 @@ public class ComprobadorDePropiedad {
 
         if (usuarioDelToken == null) {
             // No deberia llegar aqui: la cadena de seguridad ya exige un
-            // token. Si llega, es un bug de configuracion y conviene que
-            // se note con un 403, no con un null silencioso.
-            throw new AccesoDenegadoException("No se pudo determinar el usuario");
+            // token, asi que si llega es que el subject no era un id
+            // numerico.
+            //
+            // Se responde con el MISMO 404 que el caso de "es de otro",
+            // no con un mensaje propio. Un texto distinto seria un bit
+            // extra: confirmaria que el token es valido pero raro, y en un
+            // despliegue donde el secreto se comparte con otro servicio,
+            // eso distingue un token bien formado de uno manipulado. El
+            // motivo real va al log, que es donde se diagnostica.
+            log.warn("Token sin subject numerico; se responde 404. "
+                    + "Revisar si otro servicio comparte JWT_SECRET.");
+            throw AccesoDenegadoException.comoSiNoExistiera();
         }
 
         if (!usuarioDelToken.equals(recursoId)) {

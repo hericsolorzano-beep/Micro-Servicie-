@@ -41,9 +41,15 @@ public class EmisorDeToken {
     /**
      * Emite un token para un usuario.
      *
-     * El subject es el id, no el email: el email puede cambiar y el id
-     * no. Ademas evita exponer el correo de una persona a quien inspeccione
-     * el token, que va firmado pero NO cifrado.
+     * El subject es el id, no el email: el email puede cambiar y el id no.
+     *
+     * El token lleva SOLO el id. No lleva el email, aunque el metodo lo
+     * recibiera: un JWT va firmado pero NO cifrado, asi que cualquier claim
+     * es legible por quien lo lea, y eso incluye un proxy, un log de
+     * cabeceras y el propio cliente. Con el email dentro, el correo de
+     * cada persona queda en manos de quien inspeccione el token, sin
+     * necesidad de saber quien es. El parametro se conserva para no tocar
+     * la firma en las llamadas, pero no se usa.
      */
     public String emitir(Long usuarioId, String email) {
 
@@ -54,7 +60,6 @@ public class EmisorDeToken {
                 .issuer(ConfiguracionJwt.EMISOR)
                 .issuedAt(ahora)
                 .expiresAt(ahora.plusSeconds(3600))
-                .claim("email", email)
                 .build();
 
         var cabeceras = JwsHeader.with(MacAlgorithm.HS256).build();

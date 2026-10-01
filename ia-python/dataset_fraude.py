@@ -68,6 +68,46 @@ def leer_arff(ruta: str):
     return cabecera, filas
 
 
+def _verificar_cabecera(cabecera):
+    """
+    Comprueba que la cabecera del ARFF es la que COLUMNAS espera.
+
+    Existe por un fallo silencioso real: las filas del ARFF se leen por
+    POSICION y antes se escribian con una cabecera inventada (COLUMNAS)
+    sin mirar la del fichero. Si el dataset se publicara reordenado, cada
+    valor recibiria la etiqueta de su vecino, el modelo se entrenaria con
+    senas mal nombradas y las metricas publicadas pasarian a describir otro
+    sistema. Sin una excepcion, sin un aviso: solo un numero.
+
+    El riesgo no es teorico porque datos/ esta en .gitignore: cada
+    desarrollador y cada CI descargan el fichero de OpenML, asi que es el
+    dataset que se acaba usando, no el que se probo.
+    """
+    if cabecera is None:
+        raise ValueError(
+            f"{RUTA_ARFF} no tiene cabecera de atributos. ¿Es un ARFF?")
+
+    esperada = [c.lower() for c in COLUMNAS + [NOMBRE_CLASE]]
+    recibida = [c.lower() for c in cabecera]
+
+    if recibida != esperada:
+        # Se informa de la primera diferencia y de cuantas hay: un
+        # "no coincide" sin mas datos obliga a abrir el fichero a mano.
+        diferencias = [
+            f"posicion {i}: esperaba {e}, leí {r}"
+            for i, (e, r) in enumerate(zip(esperada, recibida)) if e != r
+        ]
+        raise ValueError(
+            "La cabecera del dataset no coincide con la que espera el "
+            f"entrenamiento.\n"
+            f"  esperada ({len(esperada)}): {esperada}\n"
+            f"  recibida ({len(recibida)}): {recibida}\n"
+            + "\n".join(f"  {d}" for d in diferencias)
+            + "\nEntrenar con esto reetiquetaria las columnas en silencio. "
+              "Se detiene aqui a proposito."
+        )
+
+
 def cargar_csv(ruta: str = RUTA_CSV):
     """Carga el dataset ya convertido a CSV. Cachea la conversion."""
     if not os.path.exists(ruta):
@@ -81,11 +121,12 @@ def cargar_csv(ruta: str = RUTA_CSV):
             )
 
         os.makedirs(os.path.dirname(ruta), exist_ok=True)
-        _, filas = leer_arff(RUTA_ARFF)
+        cabecera, filas = leer_arff(RUTA_ARFF)
+        _verificar_cabecera(cabecera)
 
         with open(ruta, "w", newline="", encoding="utf-8") as f:
             escritor = csv.writer(f)
-            escritor.writerow(COLUMNAS + [NOMBRE_CLASE])
+            escritor.writerow(cabecera)
             escritor.writerows(filas)
 
     with open(ruta, encoding="utf-8") as f:

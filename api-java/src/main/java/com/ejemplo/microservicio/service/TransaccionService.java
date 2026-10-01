@@ -6,6 +6,7 @@ import com.ejemplo.microservicio.dto.RespuestaFraude;
 import com.ejemplo.microservicio.dto.RespuestaFraudePython;
 import com.ejemplo.microservicio.dto.SolicitudTransaccion;
 import com.ejemplo.microservicio.exception.UsuarioNoEncontradoException;
+import com.ejemplo.microservicio.exception.PeticionRechazadaPorIAException;
 import com.ejemplo.microservicio.exception.ServicioIANoDisponibleException;
 import com.ejemplo.microservicio.repository.TransaccionRepository;
 import com.ejemplo.microservicio.domain.Usuario;
@@ -124,6 +125,27 @@ public class TransaccionService {
             guardar(transaccion, solicitud.componentes());
 
             log.warn("Transaccion registrada sin analizar: {}", e.getMessage());
+
+            throw e;
+
+        } catch (PeticionRechazadaPorIAException e) {
+            // Also saved, also without a verdict, and for the same reason.
+            //
+            // This catch is EXPLICIT on purpose. Without it, a rejection
+            // (a valid format, a country the model does not know) would
+            // fly past as a RuntimeException and the operation would not be
+            // recorded at all. Losing the record of an attempted operation
+            // is worse than keeping it as unanalyzed: it is exactly the
+            // set of things a human has to review later.
+            //
+            // What changes with respect to the case above is the status:
+            // here the client gets a 400, because the request really was
+            // invalid. Saving is not the same as saying "we analyzed it".
+            transaccion.registrarErrorAnalisis(e.getMessage());
+            guardar(transaccion, solicitud.componentes());
+
+            log.warn("Transaccion registrada sin analizar: el servicio de IA "
+                    + "rechazo los datos ({})", e.codigoRemoto());
 
             throw e;
         }

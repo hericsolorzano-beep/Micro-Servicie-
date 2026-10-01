@@ -102,6 +102,19 @@ resilience4j:
         wait-duration-in-open-state: 30s
         permitted-number-of-calls-in-half-open-state: 3
         automatic-transition-from-open-to-half-open-enabled: true
+        # Un 4xx de Python (pais no soportado, numero de componentes
+        # erroneo) NO es una caida de la dependencia, asi que no debe
+        # contar como fallo.
+        #
+        # Sin esta linea, unas diez peticiones con un pais no soportado
+        # abrian el circuito y dejaban TODAS las peticiones de fraude
+        # devolviendo CIRCUITO_ABIERTO durante 30 s, incluidas las de
+        # clientes legitimos con datos correctos. Medido: un campo de
+        # texto libre permitia dejar el detector de fraude caido para
+        # todo el mundo. En pagos, desactivar la deteccion de fraude es
+        # el fallo que mas caro sale.
+        ignore-exceptions:
+          - com.ejemplo.microservicio.exception.PeticionRechazadaPorIAException
 
     # EL ORDEN IMPORTA: el circuit breaker debe ejecutarse POR FUERA del
     # retry, para que una peticion del usuario cuente como UN fallo y no
@@ -120,9 +133,9 @@ resilience4j:
         # insistir contra algo que todavia no ha despertado.
         enable-exponential-backoff: true
         exponential-backoff-multiplier: 2
-        # Sin esto, reintentaria tambien ante errores del cliente (por
-        # ejemplo un 422 por pais no soportado), que reintentados dan el
-        # mismo 422 y solo gastan tiempo.
+        # Solo fallos de laDEPENDENCIA. Un 422 por pais no soportado esta
+        # excluido a proposito: reintentado da el mismo 422 y, ademas,
+        # alargaria la respuesta honesta de un 400.
         retry-exceptions:
           - com.ejemplo.microservicio.exception.ServicioIANoDisponibleException
     retryAspectOrder: 2

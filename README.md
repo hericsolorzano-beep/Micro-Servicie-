@@ -254,8 +254,14 @@ Cambiar de motor es una variable de entorno, no un cambio de código:
 **V1–V28 son componentes PCA anonimizados.** El dataset no publica las
 variables originales: no hay columna de "país", ni de "sexo", ni de
 "distancia". El modelo **no es interpretable**: no puede decir *por qué* una
-transacción es fraude, que es justo lo que necesita un detector real para
-que un revisor humano entienda la decisión.
+transacción es fraude.
+
+Eso no es un detalle técnico sino un límite del producto. Un detector real
+necesita poder justificar la alerta, porque es lo que permite que un revisor
+humano la acepte o la descarte; un número sin explicación obliga a revisar
+todo o a no revisar nada, y en ambos casos el detector no sirve para nada.
+Un despliegue que aspirara a esto de verdad habría que reentrenarlo con
+variables que se puedan nombrar.
 
 Por eso `pais` y `distancia_km` **se conservan en el contrato pero no
 influyen en el modelo**. Quitarlos rompería clientes; mantenerlos en
@@ -344,6 +350,31 @@ Se eliminó también el código muerto: `Identidad.java`, `FiltroApiKey`,
 `ValidadorApiKey` y `PropiedadesSeguridad` no se usaban en ningún sitio. Una
 clase de seguridad que nadie llama parece protección.
 
+### Lo que NO se oculta
+
+Un solo oráculo de enumeración sigue abierto, y conviene saber cuál:
+
+**El alta de usuario devuelve 409 si el email ya está ocupado.** Es el más
+barato de todos: sin credenciales y sin medir tiempos, solo comparando
+códigos. Se mantiene a propósito, porque devolver 201 cuando no se creó nada
+sería mentir al cliente, y porque quien se equivoca al escribir su email
+necesita enterarse. En un sistema real se mitiga con **verificación por
+correo**: se devuelve 201 siempre y quien ya tenía la cuenta recibe un aviso.
+Aquí no hay servicio de correo, así que el 409 se queda y se declara.
+
+Los otros dos sí están cerrados, y ambos se encontraron midiendo:
+
+| Oráculo | Antes | Ahora |
+|---|---|---|
+| Login por **tiempo** | usuario existente 108 ms, inexistente 16 ms (**6,8×**) | 113 ms contra 113 ms (**1,00×**) |
+| Login por **mensaje** | mismo código y mensaje | sin cambio (ya estaba bien) |
+
+El de tiempo era el que quedaba de verdad. El mensaje era idéntico en ambos
+casos, lo que hacía pensar que estaba cerrado, pero el canal silencioso
+sigue ahí: `encoder.matches()` se ejecutaba solo cuando el usuario existía.
+Con un hash de relleno fijo, los dos caminos ejecutan BCrypt y el tiempo
+deja de distinguirlos.
+
 ### Resiliencia
 
 
@@ -354,6 +385,29 @@ Tres patrones, porque fallan cosas distintas:
 | **Retry** | Fallos transitorios (Python reiniciándose) | 3 intentos, backoff exponencial |
 | **Circuit breaker** | Fallo sostenido | Abre tras 50% de fallos, espera 30s |
 | **Bulkhead** | Saturación | 10 llamadas concurrentes |
+
+**Un 4xx no es una caída de la dependencia, y por eso no cuenta como
+fallo.** Este fue el fallo más caro que encontró la revisión, y apareció al
+medir el stack, no al leer el código. Un `pais` bien formado pero fuera de la
+lista que el modelo conoce hace que Python responda 422, y ese 422 se
+traducía a "IA no disponible": era el único tipo de `retry-exceptions` y
+además contaba como fallo del circuito. Medido antes del arreglo:
+
+```
+ES -> 200 APROBADA            (petición legítima)
+AA -> 503 IA_NO_DISPONIBLE
+AB -> 503 ...
+AG -> 503 CIRCUITO_ABIERTO
+ES -> 503 CIRCUITO_ABIERTO     <-- la petición legítima ya no se atiende
+```
+
+Un campo de texto libre, sin credenciales especiales, apagaba el detector de
+fraude para todos durante 30 segundos. En un sistema de pagos, desactivar la
+detección de fraude es el fallo que más caro sale: se aceptan todos los
+fraude mientras dure. Ahora un 4xx devuelve 400 (`PETICION_INVALIDA`), no se
+reintenta y no cuenta como fallo del circuito. Y el test que lo comprueba
+ejerce el ataque de verdad, con diez países, y luego verifica que una
+petición legítima sigue respondiendo.
 
 Medido con Python parado:
 
@@ -552,15 +606,27 @@ las tres anotaciones quedaban como metadatos que nadie leía. Los tests que
 no contaban invocaciones pasaban. Solo `retryReintenta`, que cuenta
 llamadas reales, lo detectó.
 
-**Contrato validado en los dos lados.** Java valida los rangos y Pydantic los
-revalida. Si aun así llega un país que el modelo no conoce, Python responde
-422 en vez de predecir con un vector de ceros que perdería toda la señal de
-ese país.
+**Contrato validado en los dos lados, y un 4xx no se disfraza de caída.**
+Java valida los rangos y Pydantic los revalida. Si aun así llega un país que
+el modelo no conoce, Python responde 422 en vez de predecir con un vector de
+ceros que perdería toda la señal de ese país.
+
+Y ese 422 se traduce a **400**, no a 503, y no cuenta como fallo del
+circuito. La razón está medida y es la más cara del proyecto: un 4xx
+tratado como caída de la dependencia permite apagar la detección de fraude
+para todos. Ver "Resiliencia".
+
+**El histórico conserva las 28 componentes, con su umbral.** No solo el
+veredicto. Con las componentes se puede reevaluar el pasado cuando cambie el
+modelo, y con el umbral se puede leer cada decisión con las reglas que se
+tomó en su momento, en vez de presuponer las actuales. Guardar `es_fraude`
+a secas es guardar un resultado sin su razonamiento, que es justo lo que no
+se puede auditar después.
 
 ## Tests
 
 ```bash
-cd api-java && mvn test                                     # 72 tests
+cd api-java && mvn test                                     # 82 tests
 cd ia-python && ../.venv/bin/python test_modelos.py         # 16 tests
 cd ia-python && ../.venv/bin/python test_motor.py           # 11 tests
 cd ia-python && ../.venv/bin/python test_endpoint_fraude.py #  5 tests
@@ -577,12 +643,13 @@ Docker environment"*: `sg docker -c 'mvn test'`.
 | Cliente HTTP | 5 | Serialización real contra un servidor simulado |
 | Contrato HTTP y autorización | 22 | Nombres de campo, 400/404/405/415, hash ausente, aislamiento |
 | Seguridad (tokens) | 10 | Sin firmar, de otra clave, caducado, de otro emisor |
+| Comportamientos medidos | 9 | Tiempos de login, circuito, rangos |
 | Resiliencia | 6 | Que el retry reintenta de verdad, contando invocaciones |
 | Persistencia | 10 | BCrypt, `es_fraude` en NULL, transacción con IA caída |
-| Integración real | 12 | Java → Python → PostgreSQL, con la imagen de producción |
-| **Total** | **72** | |
+| Integración real | 13 | Java → Python → PostgreSQL, con la imagen de producción |
+| **Total** | **82** | |
 
-**Java (72).** El bloque que más aporta es el de **seguridad**, porque los
+**Java (82).** El bloque que más aporta es el de **seguridad**, porque los
 tokens se firman con la misma librería que usa el servicio y no se falsea
 ningún validador: un token `alg:none` escrito a mano, uno firmado con otra
 clave, uno caducado y uno de otro emisor tienen que dar 401 los cuatro. Un

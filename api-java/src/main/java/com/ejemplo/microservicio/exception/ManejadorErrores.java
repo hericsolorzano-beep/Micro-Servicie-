@@ -118,6 +118,29 @@ public ResponseEntity<RespuestaError> conflictoDeNegocio(IllegalArgumentExceptio
     }
 
     /**
+     * El servicio de IA rechazo la peticion por su contenido.
+     *
+     * 400 y no 503. La peticion del cliente no es valida (un pais fuera de
+     * la lista que el modelo conoce, un numero de componentes
+     * incorrecto), y el problema no es nuestra dependencia. Un 503 aqui
+     * seria peor que impreciso: diria al cliente que reintente, y
+     * reintentar no va a cambiar nunca el resultado.
+     *
+     * El codigo interno de Python (normalmente 422) NO se expone: que la
+     * version de Python use 422 y no 400 es un detalle de su contrato
+     * interno, no algo que deba filtrarse al cliente.
+     */
+    @ExceptionHandler(PeticionRechazadaPorIAException.class)
+    public ResponseEntity<RespuestaError> peticionRechazadaPorIA(
+            PeticionRechazadaPorIAException e) {
+        log.warn("El servicio de IA rechazo la peticion ({}): {}",
+                e.codigoRemoto(), e.getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(
+                RespuestaError.de("PETICION_INVALIDA",
+                        "Los datos enviados no son validos para el analisis"));
+    }
+
+    /**
      * JSON mal formado: el cuerpo no se puede deserializar.
      *
      * Sobrescrito sin @ExceptionHandler por el mismo motivo que el caso

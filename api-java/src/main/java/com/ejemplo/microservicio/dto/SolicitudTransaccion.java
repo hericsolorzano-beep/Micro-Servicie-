@@ -31,11 +31,31 @@ public record SolicitudTransaccion(
         @NotNull(message = "los componentes son obligatorios")
         @Size(min = 28, max = 28,
                 message = "deben venir exactamente 28 componentes (V1..V28)")
-        List<@NotNull Double> componentes,
+        // Rango validado, y no solo "que no sea null".
+        //
+        // Medido en el dataset real: V1..V28 van de -113,7 a 120,6, con
+        // el 99,8% entre -7,3 y 5,2. Sin acotar, un cliente podia mandar
+        // 1e30 en cualquier componente y, en un ensemble de arboles, los
+        // valores extremos caen en las hojas extremas: es decir, el cliente
+        // eligia la hoja y con ella el veredicto. Eso es exactamente la
+        // funcion del endpoint, en manos de quien deberia ser la contraparte.
+        //
+        // El limite es 5x el maximo absoluto observado, no el maximo. Un
+        // limite exacto rechazaria filas reales del dataset; este deja
+        // margen para datos nuevos sin admitir absurdos.
+        List<@NotNull @DecimalMin(value = "-500.0",
+                message = "un componente esta fuera de rango")
+                @DecimalMax(value = "500.0",
+                message = "un componente esta fuera de rango")
+                Double> componentes,
 
         @NotNull(message = "el monto es obligatorio")
         @DecimalMin(value = "0.01", message = "el monto debe ser mayor que cero")
-        @DecimalMax(value = "1000000.00", message = "el monto excede el limite permitido")
+        // El dataset real llega a 25.691,16. El limite anterior era
+        // 1.000.000, un valor 39 veces mayor que cualquiera que el modelo
+        // haya visto: no es "un limite generoso", es un hueco por el que
+        // la senal de entrada cae fuera de la distribucion aprendida.
+        @DecimalMax(value = "100000.00", message = "el monto excede el limite permitido")
         Double monto,
 
         @NotNull(message = "la hora es obligatoria")
