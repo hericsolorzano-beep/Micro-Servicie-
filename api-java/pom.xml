@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.9</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.ejemplo</groupId>
+    <artifactId>microservicio-api</artifactId>
+    <version>1.0.0</version>
+    <name>microservicio-api</name>
+    <description>API publica que delega la inferencia al servicio Python</description>
+
+    <properties>
+        <java.version>21</java.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!--
+        Persistencia. El driver de PostgreSQL es runtime: en desarrollo
+        se puede arrancar con H2 en memoria (tests rapidos, sin
+        contenedor) y en produccion se cambia solo la URL.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!--
+        Flyway migra el esquema. Sin esto, Hibernate crearia las tablas con
+        ddl-auto=update, que en produccion puede dejar columnas sin
+        migrar y borrar datos cuando el modelo cambia. Con Flyway el
+        esquema cambia siempre por un archivo versionado y revisable.
+        -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+
+        <!--
+        Resiliencia: circuit breaker, reintentos y bulkhead para las
+        llamadas al servicio de IA.
+
+        El bulkhead importa mas de lo que parece. Sin el, cuando Python va
+        lento, cada peticion ocupa un hilo de Tomcat hasta agotar el pool
+        entero, y la API publica deja de responder a TODO, incluido
+        /actuator/health. Con el, se rechazan solo las peticiones de
+        inferencia y el resto de la API sigue viva.
+        -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-spring-boot3</artifactId>
+            <version>2.3.0</version>
+        </dependency>
+
+        <!--
+        OBLIGATORIO para las anotaciones de Resilience4j.
+
+        El starter de AOP es lo que crea los proxies entre los que se
+        tejen @CircuitBreaker, @Retry y @Bulkhead. Sin esta dependencia,
+        resilience4j-spring-boot3 se registra en el contexto pero NO crea
+        ningun proxy: las anotaciones quedan como metadatos que nadie lee.
+
+        El fallo es silencioso y es de los mas peligrosos: la aplicacion
+        arranca, los tests que no miden el numero de intentos pasan, y las
+        anotaciones parecen proteger el codigo sin protegerlo. Solo se
+        detecta contando invocaciones reales al cliente, que es lo que
+        hace el test retryReintenta.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!--
+        Testcontainers con PostgreSQL REAL en los tests.
+
+        Se sustituyo H2 por esto. Con H2, los tests creaban las tablas
+        desde el modelo de JPA y NUNCA ejecutaban las migraciones de
+        Flyway: el esquema de produccion no lo verificaba nadie. Un
+        error en V1__esquema_inicial.sql habria llegado hasta el despliegue.
+
+        Testcontainers levanta un PostgreSQL de verdad, aplica Flyway y
+        comprueba con ddl-auto=validate que las entidades encajan con el
+        esquema. Es mas lento, pero es lo que de verdad se ejecuta en
+        produccion.
+
+        REQUIERE DOCKER. Sin el, el test falla con un mensaje explicito;
+        es preferible a que pase en verde sin comprobar nada.
+        -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!--
+        @ServiceConnection: conecta Spring al contenedor sin escribir la
+        URL a mano. Es de spring-boot-testcontainers, no de Testcontainers.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-testcontainers</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!--
+        Para el test de integracion contra el servicio de Python real: se
+        levanta la imagen Docker de ia-python con GenericContainer.
+        -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

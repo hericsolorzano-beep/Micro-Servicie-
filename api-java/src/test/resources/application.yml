@@ -1,0 +1,68 @@
+# Configuracion para los tests que levantan el contexto de Spring.
+#
+# NO hay datasource aqui a proposito. Con Testcontainers, la URL, el
+# usuario y la contrasena los inyecta @ServiceConnection desde el
+# contenedor real. Fijarlos en un archivo seria ignorarlos.
+#
+# Lo que si se fija es el COMPORTAMIENTO:
+#   - Flyway activado: los tests ejecutan las migraciones de verdad, que
+#     es justo lo que H2 no hacia y por lo que una migracion rota pasaba
+#     desapercibida.
+#   - ddl-auto=validate: Hibernate comprueba que las entidades encajan
+#     con el esquema. Si alguien anade una columna al modelo y olvida la
+#     migracion, los tests fallan aqui y no en produccion.
+
+spring:
+  jpa:
+    hibernate:
+      # validate, NUNCA create-drop en los tests. Con create-drop se
+      # crearian las tablas desde las entidades y las migraciones no se
+      # ejecutarian: exactamente el agujero que Testcontainers cierra.
+      ddl-auto: validate
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+seguridad:
+  activada: false
+  clave: ""
+
+ia:
+  base-url: http://localhost:9999
+  connect-timeout-seconds: 1
+  read-timeout-seconds: 1
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      servicioIA:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 4
+        minimum-number-of-calls: 4
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 2s
+        permitted-number-of-calls-in-half-open-state: 2
+    circuitBreakerAspectOrder: 1
+  retry:
+    instances:
+      servicioIA:
+        max-attempts: 3
+        wait-duration: 20ms
+        retry-exceptions:
+          - com.ejemplo.microservicio.exception.ServicioIANoDisponibleException
+    retryAspectOrder: 2
+  bulkhead:
+    instances:
+      servicioIA:
+        type: Semaphore
+        max-concurrent-calls: 4
+
+logging:
+  level:
+    com.ejemplo.microservicio: WARN
+    org.springframework: WARN
+    org.hibernate: WARN
+    org.flywaydb: INFO
+    com.github.dockerjava: WARN
+    org.testcontainers: INFO

@@ -1,0 +1,16 @@
+.venv/
+
+# Credenciales. NUNCA se versionan: van en .env, que se copia de
+# .env.ejemplo. Los ficheros .env.* que NO terminan en .ejemplo suelen
+# contener secretos reales.
+.env
+.env.*
+!.env.ejemplo
+
+ia-python/modelos/*.joblib
+api-java/target/
+*.log
+__pycache__/
+*.pyc
+.idea/
+.vscode/

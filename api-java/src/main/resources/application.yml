@@ -1,0 +1,135 @@
+# ---------------------------------------------------------------------
+# PERSISTENCIA
+# ---------------------------------------------------------------------
+
+spring:
+  datasource:
+    # Los ${...} permiten cambiar de base sin tocar el archivo. En Docker
+    # el host es "postgres" (el nombre del servicio), no localhost: dentro
+    # de la red de compose cada servicio se resuelve por su nombre.
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/microservicio}
+    username: ${DB_USER:microservicio}
+    password: ${DB_PASSWORD:microservicio}
+    hikari:
+      # El pool no es un adorno. Con mas conexiones simultaneas que
+      # este numero, PostgreSQL empieza a rechazar: su limite por defecto
+      # suele ser 100 conexiones y el servidor tiene su propio techo.
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 5000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    # validate y NO update, y no es una preferencia de estilo: Flyway crea
+    # el esquema y Hibernate solo comprueba que el modelo coincide con el.
+    # Con update, Hibernate podria alterar o borrar columnas sin que nadie
+    # lo hubiera decidido; con none, el desajuste no se detectaria hasta
+    # la primera consulta en produccion.
+    properties:
+      hibernate:
+        format_sql: false
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+logging:
+  level:
+    com.ejemplo.microservicio: ${LOG_LEVEL:INFO}
+    io.github.resilience4j: ${RESILIENCE_LOG_LEVEL:INFO}
+    org.hibernate.SQL: WARN
+
+# ---------------------------------------------------------------------
+# SEGURIDAD
+#
+# Desactivada por defecto para que el desarrollo local no exija
+# cabeceras. En produccion hay que poner AMBAS:
+#   SEGURIDAD_ACTIVADA=true
+#   SEGURIDAD_CLAVE=<una clave larga y aleatoria>
+#
+# Riesgo asumido de este diseno: si el despliegue no define la variable,
+# la API queda abierta. Por eso /actuator/health reporta el estado de la
+# seguridad, para poder comprobarlo sin leer el codigo.
+# ---------------------------------------------------------------------
+
+seguridad:
+  activada: ${SEGURIDAD_ACTIVADA:false}
+  clave: ${SEGURIDAD_CLAVE:}
+
+# ---------------------------------------------------------------------
+# IA
+# ---------------------------------------------------------------------
+
+ia:
+  base-url: ${IA_BASE_URL:http://localhost:8000}
+  # Timeouts en segundos. Declarados aqui, y no solo como valor por
+  # defecto en el codigo, para que se vean al leer la configuracion.
+  connect-timeout-seconds: 3
+  read-timeout-seconds: 10
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: ${HEALTH_SHOW_DETAILS:never}
+
+# ---------------------------------------------------------------------
+# RESILIENCIA
+#
+# Los tres patrones resuelven fallos distintos, y por eso los tres hacen
+# falta. El detalle de por que estan en este orden esta en el README.
+# ---------------------------------------------------------------------
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      servicioIA:
+        # Tras suficientes fallos consecutivos, el circuito se abre y las
+        # llamadas fallan de inmediato sin tocar la red. Sin esto, una IA
+        # caida recibe miles de peticiones por segundo que van a fallar
+        # todas: se desperdicia CPU y se agota el pool de hilos.
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 20
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+
+    # EL ORDEN IMPORTA: el circuit breaker debe ejecutarse POR FUERA del
+    # retry, para que una peticion del usuario cuente como UN fallo y no
+    # como tres (uno por intento). Con el orden invertido, el circuito se
+    # abriria tras tres veces menos problemas reales, y el retry no tendria
+    # opcion de funcionar.
+    circuitBreakerAspectOrder: 1
+
+  retry:
+    instances:
+      servicioIA:
+        max-attempts: 3
+        wait-duration: 200ms
+        # Con backoff exponencial: el segundo reintento espera mas que
+        # el primero. Si Python esta reiniciando, dar margen evita
+        # insistir contra algo que todavia no ha despertado.
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2
+        # Sin esto, reintentaria tambien ante errores del cliente (por
+        # ejemplo un 422 por pais no soportado), que reintentados dan el
+        # mismo 422 y solo gastan tiempo.
+        retry-exceptions:
+          - com.ejemplo.microservicio.exception.ServicioIANoDisponibleException
+    retryAspectOrder: 2
+
+  bulkhead:
+    instances:
+      servicioIA:
+        # SEMAPHORE, no THREADPOOL. El modo THREADPOOL solo funciona con
+        # llamadas asincronas (CompletableFuture); sobre una llamada
+        # sincrona lanza IllegalStateException en tiempo de ejecucion.
+        type: Semaphore
+        max-concurrent-calls: 10

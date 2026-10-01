@@ -1,0 +1,148 @@
+# Ejecutar:  docker compose up --build
+#
+# Red interna: ambos servicios viven en la misma red de compose y se
+# resuelven por nombre. Python NO publica puertos al host (no tiene "ports:"),
+# asi que desde fuera de la maquina es inalcanzable. Solo la API publica
+# expone el 8080. Esa es la version de este arquitectura en produccion.
+
+services:
+  postgres:
+    build: ./postgres
+    container_name: postgres
+    environment:
+      # Sin valores por defecto. Si faltan, compose falla al arrancar con
+      # un mensaje claro ("variable is not set"), en lugar de levantar
+      # PostgreSQL con una contrasena que alguien habia puesto aqui como
+      # ejemplo y se quedo.
+      #
+      # Las credenciales vienen de .env (copiado de .env.ejemplo), que
+      # esta en .gitignore. En produccion, de un gestor de secretos.
+      POSTGRES_DB: ${POSTGRES_DB:?define POSTGRES_DB en .env (ver .env.ejemplo)}
+      POSTGRES_USER: ${POSTGRES_USER:?define POSTGRES_USER en .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}
+    volumes:
+      # Volumen nombrado: los datos sobreviven a "docker compose down".
+      # Sin volumen, cada recreacion perderia el historial, y este
+      # proyecto justamente trata de persistir algo.
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Con el usuario REAL de la base. Sin -U, pg_isready responde
+      # "ready" aunque ese usuario no exista todavia, y api-java se
+      # conecta despues para fallar.
+      #
+      # El $$ escapa la variable para Compose: si se escribiera $, la
+      # expandiria Compose (su propio entorno, no el del contenedor) y
+      # llegaria vacia al postgres.
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  ia-python:
+    build: ./ia-python
+    container_name: ia-python
+    # El transformer ocupa ~1 GB de RAM en memoria. Este limite evita que
+    # el contenedor se la quede de los demas si la maquina se queda corta.
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    # Sin "ports": el servicio es interno. Spring lo alcanza por
+    # http://ia-python:8000 a traves de la red de compose.
+    # python:3.12-slim NO incluye curl, asi que la sonda usa el propio
+    # interprete que ya esta en la imagen. Con curl, curl(1) sale con
+    # codigo 127, el contenedor queda unhealthy y api-java nunca arranca
+    # porque depende de esta condicion.
+    healthcheck:
+      # start_period de 60s: el transformer tarda ~15s en cargar desde
+      # disco. Con 20s habia falsos negativos durante el arranque lento.
+      start_period: 60s
+      # Comprueba el CUERPO, no solo el status. /health devuelve 200
+      # aunque los modelos no hayan cargado (el campo modelos_cargados lo
+      # dice). Si la sonda solo mirase el 200, un contenedor con modelos
+      # rotos se marcaria sano y api-java arrancaria contra un servicio que
+      # solo puede responder 503.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, json, urllib.request
+          try:
+              cuerpo = urllib.request.urlopen("http://localhost:8000/health", timeout=2).read()
+              # Se PARSEA, no se busca con in: FastAPI serializa sin
+              # espacios ({"modelos_cargados":true}), asi que buscar el
+              # texto con un espacio despues de los dos puntos marcaba
+              # sano-servicio como insano.
+              sys.exit(0 if json.loads(cuerpo).get("modelos_cargados") is True else 1)
+          except Exception:
+              sys.exit(1)
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  api-java:
+    build: ./api-java
+    container_name: api-java
+    ports:
+      - "8080:8080"
+    healthcheck:
+      # La imagen eclipse-temurin:21-jre si trae curl, asi que la sonda
+      # es directa. Se consulta el actuator, que devuelve 200 cuando la
+      # aplicacion esta sirviendo peticiones.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 40s
+    # El transformer carga ~1 GB en RAM. Sin este limite, Docker podria
+    # deixar que este contenedor se coma la memoria de los demas.
+    environment:
+      # Dentro de compose el hostname es el nombre del servicio, no localhost.
+      IA_BASE_URL: http://ia-python:8000
+      # Y PostgreSQL tambien: "postgres", no localhost.
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:?define POSTGRES_DB}
+      DB_USER: ${DB_USER:?define DB_USER en .env}
+      DB_PASSWORD: ${DB_PASSWORD:?define DB_PASSWORD en .env}
+      # La seguridad viene DESACTIVADA por defecto, porque la clave no
+      # puede estar en un archivo versionado. Para activarla hay que
+      # exportarla ANTES de docker compose up:
+      #   SEGURIDAD_CLAVE=$(openssl rand -hex 32) docker compose up -d
+      # Si la clave queda vacia pero se activa, la API no acepta NINGUNA
+      # clave: falla cerrado, no abierto.
+      #
+      # Estas lineas usan ${...} para que el valor llegue al contenedor.
+      # Declararlas sin ${} hacia que la variable del shell se ignorase y
+      # la API quedara abierta sin avisar: el sintoma es que todo responde
+      # 200, y no da ningun error.
+      SEGURIDAD_ACTIVADA: ${SEGURIDAD_ACTIVADA:-false}
+      SEGURIDAD_CLAVE: ${SEGURIDAD_CLAVE:-}
+      # "never" en el despliegue normal. Para depurar:
+      #   HEALTH_SHOW_DETAILS=always docker compose up -d
+      # Igual que las de seguridad, necesita ${...} para que la variable
+      # del shell llegue al contenedor.
+      HEALTH_SHOW_DETAILS: ${HEALTH_SHOW_DETAILS:-never}
+      # El transformer tarda ~15s en cargar y ocupa ~1 GB de RAM. Con esto
+      # a 0 el arranque es de ~3s y el servicio usa solo el clasificador
+      # TF-IDF: menos preciso, pero util. Ver motor_sentimiento.py.
+      IA_TRANSFORMER: "1"
+    depends_on:
+      # depends_on con "condition: service_healthy" espera a que Python
+      # haya cargado los modelos. Sin esto, Java arranca, recibe trafico y
+      # obtiene 503 durante los primeros segundos.
+      ia-python:
+        condition: service_healthy
+      # Igual con la base de datos. Flyway migra al arrancar, asi que sin
+      # esta espera, Java falla al conectar y el contenedor entra en
+      # reinicio.
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:

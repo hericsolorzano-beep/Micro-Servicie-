@@ -1,0 +1,31 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Mismas dependencias que la imagen de produccion. Se mantiene la misma
+# version de sklearn para que los tests midan el modelo real, no una
+# aproximacion.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+    --extra-index-url https://download.pytorch.org/whl/cpu
+
+COPY entrenamiento.py main.py motor_sentimiento.py ./
+
+# Los modelos se entrenan aqui, igual que en produccion: el test debe
+# usar el mismo .joblib que se desplegaria.
+RUN python entrenamiento.py
+
+# Sin transformer. En produccion arranca en ~16s y ocupa ~660MB; para
+# integration tests eso son 40s y un giga por cada ejecucion, y lo que
+# se verifica aqui es el CONTRATO HTTP, no la calidad del modelo (de eso
+# se ocupa test_motor.py). El fallback TF-IDF responde igual de rapido
+# (~3ms) y con el mismo esquema de respuesta.
+#
+# IA_TRANSFORMER=0 activa ese camino en main.py.
+ENV IA_TRANSFORMER=0
+ENV HF_HUB_OFFLINE=1
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

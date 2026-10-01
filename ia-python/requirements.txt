@@ -1,0 +1,21 @@
+fastapi==0.142.2
+uvicorn==0.54.0
+scikit-learn==1.9.1
+pydantic==2.13.5
+joblib==1.6.0
+numpy==2.5.3
+scipy==1.18.1
+
+# Transformer de sentimiento. torch va con el indice de CPU: la imagen
+# no lleva GPU y la build de CUDA anadiria varios GB sin uso.
+transformers==5.18.0
+torch==2.14.1
+tokenizers==0.23.2
+tiktoken==0.14.0
+# Imprescindible: sin sentencepiece, transformers 5 no puede leer el
+# tokenizer SentencePiece del XLM-R y falla con un error de parseo que
+# no menciona la libreria que falta.
+sentencepiece==0.2.2
+protobuf==7.36.2
+safetensors==0.8.0
+huggingface-hub==1.33.0
