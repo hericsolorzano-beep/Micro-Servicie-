@@ -115,6 +115,36 @@ resilience4j:
         # el fallo que mas caro sale.
         ignore-exceptions:
           - com.ejemplo.microservicio.exception.PeticionRechazadaPorIAException
+          # El rechazo del PROPIO bulkhead tampoco es una caida de la
+          # dependencia. Es el error mas caro que dejo la prueba de carga,
+          # y se descubrio ahi.
+          #
+          # El bulkhead limita a 10 llamadas simultaneas, y por el orden
+          # por defecto de los aspectos de Resilience4j se ejecuta el
+          # ULTIMO. Asi que el circuito ve los BulkheadFullException que
+          # produce el propio bulkhead y los cuenta como fallos. Medido
+          # contra el stack con 20 peticiones simultaneas:
+          #
+          #   tanda 1: 10 correctas, 11 SERVICIO_SATURADO, 4 CIRCUITO_ABIERTO
+          #   tanda 2: 25 CIRCUITO_ABIERTO
+          #   y despues, EN SECUCIAL, con Python sano:
+          #   CIRCUITO_ABIERTO, CIRCUITO_ABIERTO, CIRCUITO_ABIERTO...
+          #
+          # Quince peticiones de cargaModerada apagaban la deteccion de
+          # fraude de todo el sistema durante los 30 s de
+          # wait-duration-in-open-state, sin que hubiera fallado ni una
+          # sola llamada a Python. Y lo peor no es que se disparase por un
+          # fallo: se dispara con trafico NORMAL, que es justo cuando el
+          # detector hace falta.
+          #
+          # La solucion NO es reordenar los aspectos: bulkheadAspectOrder
+          # no es configurable en Resilience4j 2.3.0 (la clase tiene
+          # getBulkheadAspectOrder() pero ningun setter, y declararla hace
+          # fallar el arranque con "No setter found for property:
+          # bulkhead-aspect-order"). Por eso se hace aqui: que el circuito
+          # no cuente los rechazos como fallos, que es exactamente lo que
+          # significa "saturacion local".
+          - io.github.resilience4j.bulkhead.BulkheadFullException
 
     # EL ORDEN IMPORTA: el circuit breaker debe ejecutarse POR FUERA del
     # retry, para que una peticion del usuario cuente como UN fallo y no
@@ -148,3 +178,4 @@ resilience4j:
         # sincrona lanza IllegalStateException en tiempo de ejecucion.
         type: Semaphore
         max-concurrent-calls: 10
+

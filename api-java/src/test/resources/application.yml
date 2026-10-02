@@ -46,14 +46,17 @@ resilience4j:
         failure-rate-threshold: 50
         wait-duration-in-open-state: 2s
         permitted-number-of-calls-in-half-open-state: 2
-        # Se replica de application.yml a proposito. Si el test
-        # ComportamientosDeSeguridadTest lee esta lista para comprobar que
-        # un 4xx no se reintenta ni cuenta como fallo, tiene que leer la
-        # MISMA configuracion que corre en produccion: si aqui faltara,
-        # el test comprobaria una configuracion que nadie usa y pasaria
-        # aunque la real estuviera mal.
+        # Las dos excepciones que el circuito NO cuenta como fallo, y que
+        # se replican de application.yml a proposito.
+        #
+        # Si el test ComportamientosDeSeguridadTest lee esta lista para
+        # comprobar que un 4xx no abre el circuito, y el test de saturacion
+        # para comprobar que un rechazo del bulkhead tampoco, tienen que
+        # leer la MISMA configuracion que corre en produccion. Con una
+        # lista mas corta aqui, ambos pasarian aunque la real siguiera mal.
         ignore-exceptions:
           - com.ejemplo.microservicio.exception.PeticionRechazadaPorIAException
+          - io.github.resilience4j.bulkhead.BulkheadFullException
     circuitBreakerAspectOrder: 1
   retry:
     instances:

@@ -14,6 +14,8 @@ microservicio/
 │   ├── test_modelos.py      Tests del contrato y del orden de columnas
 │   ├── test_motor.py        Tests del motor y de la degradación
 │   ├── test_endpoint_fraude.py  Tests del umbral frente a la respuesta
+│   ├── prueba_carga.py          Carga, saturación y caída de la IA
+│   ├── comparar_datasets.py     ¿Aportan los datos sintéticos?
 │   ├── requirements.txt    Versiones fijadas
 │   ├── datos/            Dataset descargado (144 MB, NO versionado)
 │   ├── modelos/            .joblib generados (5 MB, NO versionados)
@@ -427,12 +429,64 @@ reintenta y no cuenta como fallo del circuito. Y el test que lo comprueba
 ejerce el ataque de verdad, con diez países, y luego verifica que una
 petición legítima sigue respondiendo.
 
-Medido con Python parado:
+Medido con Python parado, de verdad (contenedor parado, no simulado):
 
 ```
-circuito cerrado:  0,64 s por petición  (3 reintentos × connect-timeout)
-circuito abierto:  0,02 s por petición  (rechazo inmediato, sin tocar la red)
+petición  1: [503]  9633 ms   IA_NO_DISPONIBLE   <- 3 reintentos × timeout
+petición  5: [503]   624 ms   IA_NO_DISPONIBLE
+petición 15: [503]     6 ms   CIRCUITO_ABIERTO   <- ya no toca la red
+petición 25: [503]     4 ms   CIRCUITO_ABIERTO
+
+health: DOWN
 ```
+
+Y la recuperación, sola, sin que nadie la empuje:
+
+```
+t+ 2s: [503] 4,4 ms  CIRCUITO_ABIERTO
+t+10s: [503] 4,5 ms  CIRCUITO_ABIERTO
+t+12s: [200] 118 ms  APROBADA        <- medio abierto y recuperado
+```
+
+De 9633 ms a 4 ms son **2400×** más rápido una vez abierto, y sin gastar
+un solo paquete hacia un servicio que ya sabemos que está caído. Los 12
+segundos de corte son los `permitted-number-of-calls-in-half-open-state: 3`
+probando: es deliberado no recuperar antes, porque un servicio que acaba de
+caer necesita unos segundos para volver de verdad.
+
+### La saturación local no puede apagar la detección de fraude
+
+Este lo encontró `ia-python/prueba_carga.py`, y es el fallo más caro del
+proyecto. El bulkhead (10 llamadas) y el circuito (50% de fallos) estaban
+bien configurados **por separado** y juntos se anulaban:
+
+Por el orden por defecto de los aspectos de Resilience4j, el bulkhead se
+ejecuta **el último**. Así que el circuito ve los `BulkheadFullException` que
+produce el propio bulkhead y los cuenta como fallos de la dependencia.
+Medido con 20 peticiones simultáneas:
+
+```
+tanda 1: 10 correctas, 11 SERVICIO_SATURADO, 4 CIRCUITO_ABIERTO
+tanda 2: 25 CIRCUITO_ABIERTO
+y después, EN SECUCIAL, con Python sano:
+CIRCUITO_ABIERTO, CIRCUITO_ABIERTO, CIRCUITO_ABIERTO...
+```
+
+Quince peticiones de tráfico **normal** apagaban la detección de fraude de
+todo el sistema durante 30 segundos, sin que hubiera fallado ni una sola
+llamada. Y lo peor no es que se disparara por un fallo: se dispara con
+tráfico normal, que es justo cuando el detector hace falta.
+
+Se arregla con `ignore-exceptions` en el circuito, añadiendo
+`BulkheadFullException`: la saturación local se resuelve en local. **No** se
+reordenan los aspectos, porque `bulkheadAspectOrder` no es configurable en
+Resilience4j 2.3.0 (la clase tiene `getBulkheadAspectOrder()` pero ningún
+setter, y declararla hace fallar el arranque con *"No setter found for
+property: bulkhead-aspect-order"*). Se intentó primero y se descartó por eso.
+
+Medido después del arreglo, con 20 y con 40 simultáneas: siguen entrando 10
+peticiones reales y el resto se rechaza con `SERVICIO_SATURADO`, sin que el
+circuito se abra nunca.
 
 30× más rápido una vez abierto, y sin gastar un solo paquete hacia un
 servicio que ya sabemos que está caído.
@@ -527,6 +581,54 @@ estado: DOWN
 
 Solo registra el tipo de excepción, no la traza: la traza incluye la URL de
 conexión con las credenciales.
+
+## Qué aportan los datos sintéticos: nada
+
+`ia-python/comparar_datasets.py` responde a una pregunta que surge sola al
+mirar el historial del proyecto: el modelo se entrenó primero con 60.000
+casos inventados y ahora usa 284.807 reales. ¿Eran necesarios los
+inventados?
+
+**Método.** Cuatro configuraciones, iguales salvo los datos de entrada, y
+**siempre evaluadas sobre el mismo conjunto de prueba: 98 casos de fraude
+reales**. Es lo único comparable; evaluar lo sintético sobre filas
+sintéticas sería medir si el modelo distingue lo que él mismo generó.
+
+| Configuración | AUC | AP | recall | atrapa | falsos | coste |
+|---|---|---|---|---|---|---|
+| **A. solo reales** (284.807) | 0,9525 | 0,8561 | 0,8367 | 82/98 | 6 | **22** |
+| B. solo sintéticos (60.000) | **0,9685** | 0,7858 | **0,8878** | **87/98** | 49 | 60 |
+| C. reales + sintéticos | 0,9623 | **0,8775** | 0,8469 | 83/98 | 11 | 26 |
+| D. reales + sintéticos como legítimas | 0,9476 | 0,8542 | 0,8163 | 80/98 | 5 | 23 |
+
+El **coste** es fraude que se escapa + legítima marcada como fraude: el
+número que de verdad tiene que mirar quien opera esto, y no el AUC.
+
+**Se queda con A, pero no porque gane las tres cabeceras.** B gana en AUC y
+recall, y eso es exactamente la trampa: atrapa 5 fraude más a cambio de 43
+falsos positivos más. Su *average precision* (0,7858) es **peor** que la de
+A, que es justo la métrica que mide la precisión en todo el rango de
+umbrales. Traducido a trabajo humano: B manda a revisión 49 transacciones
+legítimas en vez de 6. El coste se paga ahora; el beneficio es hipotético.
+
+C queda a 26, muy cerca de A, con el mejor *average precision* de todos. No
+compensa el doble de tiempo de entrenamiento por un fraude más.
+
+### La fuga que casi convirtió la comparación en mentira
+
+La primera ejecución dio a B un AUC de **0,9987**, demasiado bueno para ser
+verdad. La causa: el generador de sintéticos sorteaba casos de fraude del
+dataset **completo**, no del subconjunto de entrenamiento. Con 492 casos y
+3.600 sorteos con reemplazo, cada caso aparecía unas siete veces.
+
+Medido: el **21,8% de los fraudulentos sintéticos salía de filas que
+estaban en el conjunto de prueba**. El modelo se entrenaba con copias
+(×1,15) de lo que después se le pedía que generalizara. No era
+generalización: era memorización con otro disfraz.
+
+La firma fue que la metrica salia demasiado buena, no un error. Por eso el
+generador ahora exige que se le pase el subconjunto autorizado, sin valor
+por defecto: un default correcto sería facilísimo de olvidar.
 
 ## Decisiones de diseño
 
@@ -644,10 +746,14 @@ se puede auditar después.
 ## Tests
 
 ```bash
-cd api-java && mvn test                                     # 83 tests
+cd api-java && mvn test                                     # 87 tests
 cd ia-python && ../.venv/bin/python test_modelos.py         # 16 tests
 cd ia-python && ../.venv/bin/python test_motor.py           # 11 tests
 cd ia-python && ../.venv/bin/python test_endpoint_fraude.py #  5 tests
+
+# Scripts de medicion (no son tests: miden y finder fallos)
+cd ia-python && ../.venv/bin/python prueba_carga.py         # carga y caida
+cd ia-python && ../.venv/bin/python comparar_datasets.py    # sinteticos vs reales
 ```
 
 Los tests de persistencia y de integración usan **Testcontainers** y levantan
@@ -660,14 +766,15 @@ Docker environment"*: `sg docker -c 'mvn test'`.
 | Lógica de negocio | 7 | Decisiones de acción, nivel de riesgo y degradación |
 | Cliente HTTP | 5 | Serialización real contra un servidor simulado |
 | Contrato HTTP y autorización | 23 | Nombres de campo, 400/404/405/415, hash ausente, aislamiento |
+| Saturación | 4 | Que la saturación local no abra el circuito |
 | Seguridad (tokens) | 10 | Sin firmar, de otra clave, caducado, de otro emisor |
 | Comportamientos medidos | 9 | Tiempos de login, circuito, rangos |
 | Resiliencia | 6 | Que el retry reintenta de verdad, contando invocaciones |
 | Persistencia | 10 | BCrypt, `es_fraude` en NULL, transacción con IA caída |
 | Integración real | 13 | Java → Python → PostgreSQL, con la imagen de producción |
-| **Total** | **83** | |
+| **Total** | **87** | |
 
-**Java (83).** El bloque que más aporta es el de **seguridad**, porque los
+**Java (87).** El bloque que más aporta es el de **seguridad**, porque los
 tokens se firman con la misma librería que usa el servicio y no se falsea
 ningún validador: un token `alg:none` escrito a mano, uno firmado con otra
 clave, uno caducado y uno de otro emisor tienen que dar 401 los cuatro. Un
@@ -727,5 +834,11 @@ sino qué pasa **cuando falla**: se le inyecta un motor que lanza
 respaldo, que el estado lo refleja, y que tres fallos seguidos no dejan el
 servicio a medias.
 
-Ningún conjunto entrena modelos. El que carga el transformer tarda ~30 s solo
-en eso.
+**Saturación (4).** Ejercitan el bulkhead de verdad, con hilos a la vez, y
+comprueban dos cosas opuestas: que saturarlo produce rechazos pero **no**
+abre el circuito, y que una caída real de Python **sí** lo abre. Sin la
+segunda, la primera pasaría aunque el circuito no protegiera de nada.
+
+Ningún conjunto entrena modelos. El que carga el transformer tarda ~30 s
+solo en eso. `comparar_datasets.py` sí entrena cuatro RandomForest y tarda
+varios minutos: es un experimento, no un test.
