@@ -152,16 +152,31 @@ def entrenar_fraude():
     # umbral: se aceptan mas falsos positivos a cambio de detectar mas.
     precision, recall, umbrales = precision_recall_curve(y_test, prob)
 
+    # "detectados" son SOLO los casos de fraude que caen por encima del
+    # umbral. Antes se imprimia (prob >= umbral).sum(), que cuenta
+    # TODAS las transacciones por encima del umbral, incluidas las
+    # legitimas: en el umbral 0,50 daba 77 "detectados" cuando solo
+    # 73 eran fraude y 4 eran falsos positivos. Una columna que suma
+    # acierto y error, y lo llama deteccion.
+    #
+    # Los falsos positivos van en su propia columna, porque son el
+    # coste real de bajar el umbral y mezclarlos con los aciertos es
+    # justo lo que hace ilegible la tabla.
+    n_fraude = int((y_test == 1).sum())
     print("\nprecision/recall por umbral:")
     print(f"  {'umbral':>8} {'precision':>10} {'recall':>8} "
-          f"{'detectados':>11} {'perdidos':>9}")
+          f"{'fraude':>8} {'falsos+':>9} {'perdidos':>9}")
     for objetivo in (0.50, 0.70, 0.80, 0.90, 0.95):
         i = np.argmin(np.abs(umbrales - objetivo))
-        detectados = int((prob >= umbrales[i]).sum() & 0xFFFFFFFF
-                          + int((y_test == 1).sum() * recall[i]))
-        perdidos = int((y_test == 1).sum() * (1 - recall[i]))
-        print(f"  {umbrales[i]:8.3f} {precision[i]:10.4f} {recall[i]:8.4f} "
-              f"{detectados:>11} {perdidos:>9}")
+        # Se usa el umbral REAL de la curva, no el objetivo pedido, que
+        # no tiene por que existir entre los valores devueltos.
+        u = umbrales[i]
+        por_encima = prob >= u
+        fraude_detectado = int((por_encima & (y_test == 1)).sum())
+        falsos_positivos = int((por_encima & (y_test == 0)).sum())
+        perdidos = n_fraude - fraude_detectado
+        print(f"  {u:8.3f} {precision[i]:10.4f} {recall[i]:8.4f} "
+              f"{fraude_detectado:>8} {falsos_positivos:>9} {perdidos:>9}")
 
     # El umbral elegido se guarda CON el modelo, no se recalcula en
     # produccion: si el servicio eligiera otro, la metrica publicada

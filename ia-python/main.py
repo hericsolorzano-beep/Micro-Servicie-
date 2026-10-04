@@ -228,9 +228,22 @@ def predecir_fraude(req: TransaccionRequest) -> FraudeResponse:
     # APROBADA para algo que el nivel daba por sospechoso. Incoherente.
     prediccion = int(probabilidad >= umbral_fraude)
 
-    if probabilidad >= 0.85:
+    # Los cortes de riesgo se DERIVAN del umbral, no se escriben a mano.
+    #
+    # Estaban fijos en 0.85 y 0.50, lo cual era coherente solo mientras el
+    # umbral fuese <= 0.50. Con umbral 0.70 y probabilidad 0.60, la
+    # respuesta decia es_fraude=false y nivel_riesgo="alto" en la misma
+    # llamada: "no es fraude" y "riesgo alto" a la vez. Ese es justo el
+    # descuadre que un comentario anterior dice haber corregido, volvio a
+    # aparecer en cuanto el umbral subio.
+    #
+    # La regla que no puede fallar es la de la frontera: si es_fraude es
+    # false, el nivel tiene que ser "bajo". Por eso "medio" empieza
+    # exactamente en el umbral, y los siguientes van por proporcion
+    # sobre ese mismo umbral.
+    if probabilidad >= min(0.99, umbral_fraude * 2.5):
         nivel = "critico"
-    elif probabilidad >= 0.50:
+    elif probabilidad >= min(0.95, umbral_fraude * 1.5):
         nivel = "alto"
     elif probabilidad >= umbral_fraude:
         nivel = "medio"

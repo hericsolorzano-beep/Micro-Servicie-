@@ -103,6 +103,58 @@ class ConsistenciaUmbralTest(unittest.TestCase):
                          f"Legitima real marcada como fraude "
                          f"(prob={r_legitima.probabilidad})")
 
+    def test_nivel_coherente_con_cualquier_umbral(self):
+        """
+        La invariante debe aguantar si alguien cambia el umbral.
+
+        Los niveles se calculaban con cortes FIJOS (0.85 critico, 0.50
+        alto), lo cual solo era coherente mientras el umbral fuese <=
+        0.50. Con umbral 0.70 y probabilidad 0.60, la respuesta decia
+
+            es_fraude=false, nivel_riesgo="alto"
+
+        a la vez. No es un caso teorico: subir el umbral es la primera
+        palanca que se toca cuando el equipo quiere reducir falsos
+        positivos, asi que es el cambio mas probable de todos.
+
+        Por eso el test no fija un umbral, los recorre. Si alguien
+        reintroduce cortes fijos, falla aqui y no en produccion.
+        """
+        original = servicio.umbral_fraude
+        try:
+            for umbral in (0.05, 0.30, 0.45, 0.55, 0.70, 0.90):
+                servicio.umbral_fraude = umbral
+                for nombre, fila in (("fraude", self.fraude),
+                                     ("legitima", self.legitima)):
+                    r = self._pedir(fila)
+                    if r.es_fraude:
+                        continue
+                    # Asercion y no fail() incondicional: fail() rompia
+                    # anunciando nivel='bajo', que es justo el valor
+                    # correcto. Un test que falla cuando todo va bien
+                    # entrena a ignorar su propio aviso.
+                    self.assertEqual(
+                        r.nivel_riesgo, "bajo",
+                        f"umbral={umbral} {nombre}: es_fraude=false pero "
+                        f"nivel_riesgo={r.nivel_riesgo!r}. Si no es fraude, "
+                        "el nivel tiene que ser 'bajo'.")
+        finally:
+            servicio.umbral_fraude = original
+
+    def test_nivel_crece_con_la_probabilidad(self):
+        """El nivel no puede bajar al subir la probabilidad."""
+        original = servicio.umbral_fraude
+        servicio.umbral_fraude = 0.30
+        try:
+            orden = {"bajo": 0, "medio": 1, "alto": 2, "critico": 3}
+            niveles = [orden[self._pedir(f).nivel_riesgo]
+                       for f in (self.legitima, self.fraude)]
+            self.assertLessEqual(niveles[0], niveles[1],
+                                 "El fraude real no puede tener un riesgo "
+                                 "menor que la transaccion legitima.")
+        finally:
+            servicio.umbral_fraude = original
+
     def test_umbral_mas_bajo_detecta_mas_fraude(self):
         """
         Motivo por el que el umbral se baja a 0.30: perder un fraude

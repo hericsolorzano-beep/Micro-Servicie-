@@ -708,6 +708,60 @@ La firma fue que la metrica salia demasiado buena, no un error. Por eso el
 generador ahora exige que se le pase el subconjunto autorizado, sin valor
 por defecto: un default correcto sería facilísimo de olvidar.
 
+## Dos defectos que no eran de rendimiento, sino de honestidad
+
+Ninguno de los dos cambia el AUC del modelo. Los dos hacían que el
+sistema publicara o expusiera números que no describían lo que ocurría.
+
+### La tabla de umbral mezclaba aciertos con errores
+
+`entrenamiento.py` imprimía una columna llamada "detectados" que calculara
+así:
+
+```python
+detectados = int((prob >= umbrales[i]).sum() & 0xFFFFFFFF
+                  + int((y_test == 1).sum() * recall[i]))
+```
+
+`& 0xFFFFFFFF` no hace nada: es una máscara de bits sobre un número de un
+solo dígito. Y `(prob >= umbral).sum()` cuenta **todas** las transacciones
+por encima del umbral, incluidas las legítimas.
+
+Medido en el umbral 0,50:
+
+| Lo que imprimía | Real |
+|---|---|
+| 77 "detectados" | 73 son fraude, **4 son falsos positivos** |
+
+Una columna que suma acierto y error, y lo llama detección. Ahora los
+fraudulentos y los falsos positivos van en columnas separadas, porque son
+cosas distintas y mezclarlas es lo que hace la tabla ilegible.
+
+### El nivel de riesgo se contradecía si subías el umbral
+
+Los niveles se calculaban con cortes fijos en el código: 0,85 `crítico`,
+0,50 `alto`. Eso solo era coherente mientras el umbral fuese ≤ 0,50.
+
+Con umbral 0,70 y probabilidad 0,60, la API respondía:
+
+```
+es_fraude: false      nivel_riesgo: "alto"
+```
+
+"No es fraude" y "riesgo alto" en la misma llamada. Y no es un caso
+teórico: **subir el umbral es la primera palanca que se toca para reducir
+falsos positivos**, así que es el cambio más probable de todos.
+
+La invariante que no puede fallar es la de la frontera: si `es_fraude` es
+falso, el nivel tiene que ser `bajo`. Ahora los cortes se derivan del
+propio umbral (`umbral`, `umbral * 1.5`, `umbral * 2.5`), así que la
+coherencia se mantiene al moverlo. Con el umbral actual de 0,30 los
+cortes quedan en 0,45 y 0,75, casi idénticos a los de antes.
+
+Hay un test que recorre **seis umbrales distintos** porque el anterior
+comprobaba la invariante solo con el actual, que es justo el caso donde
+funcionaba.
+
 ## Decisiones de diseño
 
 **El umbral se guarda DENTRO del `.joblib`, no en la configuración.** El
@@ -827,7 +881,7 @@ se puede auditar después.
 cd api-java && mvn test                                     # 87 tests
 cd ia-python && ../.venv/bin/python test_modelos.py         # 16 tests
 cd ia-python && ../.venv/bin/python test_motor.py           # 11 tests
-cd ia-python && ../.venv/bin/python test_endpoint_fraude.py #  5 tests
+cd ia-python && ../.venv/bin/python test_endpoint_fraude.py #  7 tests
 
 # Scripts de medicion (no son tests: miden y finder fallos)
 cd ia-python && ../.venv/bin/python prueba_carga.py         # carga y caida
