@@ -16,6 +16,7 @@ microservicio/
 │   ├── test_endpoint_fraude.py  Tests del umbral frente a la respuesta
 │   ├── prueba_carga.py          Carga, saturación y caída de la IA
 │   ├── comparar_datasets.py     ¿Aportan los datos sintéticos?
+│   ├── evaluar_features.py      ¿Ayudan las variables derivadas? (no)
 │   ├── requirements.txt    Versiones fijadas
 │   ├── datos/            Dataset descargado (144 MB, NO versionado)
 │   ├── modelos/            .joblib generados (5 MB, NO versionados)
@@ -302,6 +303,68 @@ misma frase caía en ambos conjuntos. Y su lista de stop words incluía `no`
 y `sin`, que son las palabras con más señal del corpus (`no` aparece 5
 veces, todas negativas). Arreglar ambas cosas subió el 67% → 72%. Ninguno
 de los dos fallos daba error: eran números.
+
+## Lo que se intentó para mejorar el recall, y no sirvió
+
+`ia-python/evaluar_features.py` responde a la pregunta que queda después de
+aceptar el recall de 0,8367: **¿y si se añaden variables derivadas de la hora
+y el importe?**
+
+La respuesta medida es **no**, y el propio script es el motivo de existir: una
+idea que no funciona, documentada con su número, es más útil que no haberla
+intentado, porque evita que se repita.
+
+Se probaron seis features derivadas: `sin_hora`, `cos_hora`, `es_noche`,
+`log1p(importe)`, `z(importe)` y `es_atípico` (|z| > 3).
+
+| Configuración | Columnas | AUC | AP | atrapa | falsos | coste |
+|---|---|---|---|---|---|---|
+| 30 columnas, `Time` real | 30 | 0,9525 | 0,8561 | 82/98 | 6 | 22 |
+| 30 columnas, `Time` como lo sirve el servicio | 30 | 0,9576 | 0,8538 | 82/98 | 6 | 22 |
+| **36 columnas, con las seis derivadas** | 36 | 0,9575 | **0,8713** | **81/98** | 6 | **23** |
+
+Las derivadas suben el *average precision* pero **atrapan un fraude menos** y
+suben el coste. De los 16 que escapaban, se recuperan **0**. No se añadirían.
+
+### Por qué se midió con `Time` sustituido
+
+Antes de nada, el script reemplaza `Time` por `hora * 3600` en el conjunto de
+prueba, que es exactamente lo que hace `main.py` al servir. Sin eso, las
+métricas describen un sistema que no existe: el dataset da `Time` en segundos
+desde la primera transacción y abarca unos dos días, mientras que el servicio
+solo recibe la hora (0–23).
+
+Sale un dato tranquilizador: el coste es **22 en ambos casos**. Ese desajuste
+existe y está documentado, pero **no está haciendo daño**. Se midió, en vez
+de suponer que sí o que no.
+
+### Por qué no se añadieron `día` ni `fin_de_semana`
+
+Porque no son consistentes entre entrenamiento e inferencia, y eso solo se ve
+al razonar sobre el servicio, no en ninguna métrica.
+
+Con `Time = hora * 3600` nunca se pasa de 86.400, así que `(Time // 86400) % 7`
+vale **siempre 0** en producción. Habría que haber entrenado con esa columna
+variando y servir siempre 0: el modelo vería una señal que no existe. Habría
+inflado el número de features y **empeorado** el resultado en producción sin
+que ninguna métrica de este script lo mostrara.
+
+Por eso se descartan antes de medir, y no después.
+
+### El límite que no se puede sortear
+
+Con **492 casos de fraude** en 284.807 transacciones, el conjunto de prueba
+deja 98. Un solo caso mueve el recall un punto entero. El coste se mueve en
+unidades de 22 a 23 entre configuraciones contiguas: eso está **por debajo del
+ruido**, y cualquier "mejora" de 1 o 2 casos no es una mejora.
+
+Consecuencia honesta: **no se puede demostrar una mejora pequeña con este
+dataset.** Por eso se paró aquí, en vez de seguir ajustando hasta encontrar
+un número que saliera mejor. Continuar sería fabricar una señal.
+
+Lo que sí falta es información que el dataset no tiene: patrón de gasto por
+usuario, dispositivo, geolocalización real, velocidad. Eso ya es otro
+proyecto.
 
 ## Seguridad y resiliencia
 
@@ -754,6 +817,7 @@ cd ia-python && ../.venv/bin/python test_endpoint_fraude.py #  5 tests
 # Scripts de medicion (no son tests: miden y finder fallos)
 cd ia-python && ../.venv/bin/python prueba_carga.py         # carga y caida
 cd ia-python && ../.venv/bin/python comparar_datasets.py    # sinteticos vs reales
+cd ia-python && ../.venv/bin/python evaluar_features.py     # features derivadas (no)
 ```
 
 Los tests de persistencia y de integración usan **Testcontainers** y levantan
