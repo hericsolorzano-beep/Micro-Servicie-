@@ -3,6 +3,21 @@
 API en Java (Spring Boot) que recibe datos de usuarios y delega la
 inferencia a un servicio Python con modelos de scikit-learn.
 
+```mermaid
+graph TD
+    Cliente[Cliente externo] -->|HTTP + JWT| Java[API Spring Boot :8080]
+    subgraph Red interna de Docker
+        Java -->|HTTP interno, DTO tipado| Python[Servicio IA FastAPI]
+        Java -->|JDBC| Postgres[(PostgreSQL 17)]
+        Python -->|scikit-learn / Transformers| Memoria[Modelos en memoria]
+    end
+```
+
+Solo la API Java publica puertos. El servicio de IA vive en la red interna
+de Docker y no es alcanzable desde fuera: no es una medida de estilo, es la
+razón de que un fallo de inferencia no pueda convertirse en superficie de
+ataque.
+
 ```
 microservicio/
 ├── ia-python/            Servicio de IA (interno, no expuesto)
